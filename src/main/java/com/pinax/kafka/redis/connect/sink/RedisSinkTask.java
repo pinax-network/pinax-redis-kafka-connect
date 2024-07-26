@@ -1,10 +1,10 @@
 package com.pinax.kafka.redis.connect.sink;
 
 import java.util.Collection;
-import java.util.HashSet;
-import java.util.List;
+// import java.util.HashSet;
+// import java.util.List;
 import java.util.Map;
-import java.util.Set;
+// import java.util.Set;
 
 import org.apache.kafka.common.config.AbstractConfig;
 import org.apache.kafka.connect.errors.DataException;
@@ -13,17 +13,25 @@ import org.apache.kafka.connect.sink.SinkTask;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import redis.clients.jedis.ClusterPipeline;
-import redis.clients.jedis.DefaultJedisClientConfig;
-import redis.clients.jedis.HostAndPort;
+// import redis.clients.jedis.ClusterPipeline;
+// import redis.clients.jedis.DefaultJedisClientConfig;
+// import redis.clients.jedis.HostAndPort;
+import redis.clients.jedis.JedisPooled;
+import redis.clients.jedis.Pipeline;
 
 public class RedisSinkTask extends SinkTask {
-    private final DefaultJedisClientConfig DEFAULT_CLIENT_CONFIG = DefaultJedisClientConfig.builder().build();
+    // private final DefaultJedisClientConfig DEFAULT_CLIENT_CONFIG =
+    // DefaultJedisClientConfig.builder().build();
     private final Logger logger = LoggerFactory.getLogger(RedisSinkConnector.class);
 
-    private ClusterPipeline pipeline = null;
+    // private ClusterPipeline pipeline = null;
 
-    private List<String> redisHosts;
+    private JedisPooled jedis = null;
+    private Pipeline pipeline = null;
+
+    // private List<String> redisHosts;
+
+    private String redisHost;
 
     @Override
     public void start(Map<String, String> properties) {
@@ -32,24 +40,36 @@ public class RedisSinkTask extends SinkTask {
         AbstractConfig config = new AbstractConfig(RedisSinkConfig.CONFIG_DEF, properties);
 
         // Prepare Redis connection
-        redisHosts = config.getList(RedisSinkConfig.HOSTS);
+        // redisHosts = config.getList(RedisSinkConfig.HOSTS);
+        redisHost = config.getString(RedisSinkConfig.HOST);
 
         try {
             // Create a Redis cluster connection
-            Set<HostAndPort> jedisClusterNodes = new HashSet<HostAndPort>();
+            // Set<HostAndPort> jedisClusterNodes = new HashSet<HostAndPort>();
 
-            for (String redisHostPort : redisHosts) {
-                String[] parts = redisHostPort.split(":");
-                if (parts.length != 2) {
-                    throw new RuntimeException("Invalid Redis host and port: " + redisHostPort);
-                }
+            // for (String redisHostPort : redisHosts) {
+            // String[] parts = redisHostPort.split(":");
+            // if (parts.length != 2) {
+            // throw new RuntimeException("Invalid Redis host and port: " + redisHostPort);
+            // }
 
-                String redisHost = parts[0];
-                int redisPort = Integer.parseInt(parts[1]);
-                jedisClusterNodes.add(new HostAndPort(redisHost, redisPort));
+            // String redisHost = parts[0];
+            // int redisPort = Integer.parseInt(parts[1]);
+            // jedisClusterNodes.add(new HostAndPort(redisHost, redisPort));
+            // }
+
+            // pipeline = new Pipeline(jedisClusterNodes, DEFAULT_CLIENT_CONFIG);
+
+            String[] parts = redisHost.split(":");
+            if (parts.length != 2) {
+                throw new RuntimeException("Invalid Redis host and port: " + redisHost);
             }
 
-            pipeline = new ClusterPipeline(jedisClusterNodes, DEFAULT_CLIENT_CONFIG);
+            String redisHost = parts[0];
+            int redisPort = Integer.parseInt(parts[1]);
+            jedis = new JedisPooled(redisHost, redisPort);
+            pipeline = jedis.pipelined();
+
             logger.info("Redis connection created");
         } catch (Exception e) {
             logger.error("Failed to create Redis connection", e);
@@ -100,6 +120,9 @@ public class RedisSinkTask extends SinkTask {
         logger.info("Stopping Redis sink task");
         if (pipeline != null) {
             pipeline.close();
+        }
+        if (jedis != null) {
+            jedis.close();
         }
     }
 
