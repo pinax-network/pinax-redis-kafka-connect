@@ -1,7 +1,9 @@
 package com.pinax.kafka.redis.connect.sink;
 
 import java.util.Collection;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.kafka.common.config.AbstractConfig;
 import org.apache.kafka.connect.errors.RetriableException;
@@ -11,16 +13,21 @@ import org.apache.kafka.connect.sink.SinkTask;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import redis.clients.jedis.JedisPooled;
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisSentinelPool;
 import redis.clients.jedis.Pipeline;
 
 public class RedisSinkTask extends SinkTask {
     private final Logger logger = LoggerFactory.getLogger(RedisSinkConnector.class);
 
-    private JedisPooled jedis = null;
-    private Pipeline pipeline = null;
+    private Set<String> sentinels = null;
 
-    private String redisHost;
+    private Jedis jedis = null;
+    private JedisSentinelPool jedisSentinelPool = null;
+    private Pipeline jedisPipeline = null;
+
+    private List<String> redisHosts;
+    private String redisMaster;
 
     @Override
     public void start(Map<String, String> properties) {
@@ -29,19 +36,18 @@ public class RedisSinkTask extends SinkTask {
         AbstractConfig config = new AbstractConfig(RedisSinkConfig.CONFIG_DEF, properties);
 
         // Prepare Redis connection
-        redisHost = config.getString(RedisSinkConfig.HOST);
+        redisHosts = config.getList(RedisSinkConfig.HOSTS);
+        redisMaster = config.getString(RedisSinkConfig.MASTER);
 
         try {
 
-            String[] parts = redisHost.split(":");
-            if (parts.length != 2) {
-                throw new RuntimeException("Invalid Redis host and port: " + redisHost);
+            for (String redisHostPort : redisHosts) {
+                sentinels.add(redisHostPort);
             }
 
-            String redisHost = parts[0];
-            int redisPort = Integer.parseInt(parts[1]);
-            jedis = new JedisPooled(redisHost, redisPort);
-            pipeline = jedis.pipelined();
+            jedisSentinelPool = new JedisSentinelPool(redisMaster, sentinels);
+            jedis = jedisSentinelPool.getResource();
+            jedisPipeline = jedis.pipelined();
 
             logger.info("Redis connection created");
         } catch (Exception e) {
@@ -73,8 +79,8 @@ public class RedisSinkTask extends SinkTask {
                 double doubleValue = Double.parseDouble(parts[0]);
                 long expireAtValue = Long.parseLong(parts[1]);
 
-                pipeline.incrByFloat(key, doubleValue);
-                pipeline.expireAt(key, expireAtValue);
+                jedisPipeline.incrByFloat(key, doubleValue);
+                jedisPipeline.expireAt(key, expireAtValue);
 
                 logger.debug("Record written to Redis: key={}, value={}", key, value);
             }
@@ -85,17 +91,20 @@ public class RedisSinkTask extends SinkTask {
             throw new RetriableException(message, e);
         }
 
-        pipeline.sync();
+        jedisPipeline.sync();
     }
 
     @Override
     public void stop() {
         logger.info("Stopping Redis sink task");
-        if (pipeline != null) {
-            pipeline.close();
+        if (jedisPipeline != null) {
+            jedisPipeline.close();
         }
         if (jedis != null) {
             jedis.close();
+        }
+        if (jedisSentinelPool != null) {
+            jedisSentinelPool.destroy();
         }
     }
 
