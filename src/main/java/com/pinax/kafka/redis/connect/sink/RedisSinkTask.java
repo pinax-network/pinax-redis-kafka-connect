@@ -86,8 +86,6 @@ public class RedisSinkTask extends SinkTask {
                 logger.debug("Record written to Redis: key={}, value={}", key, value);
             }
 
-            jedisPipeline.sync();
-
         } catch (Exception e) {
             final String message = "Failed to write record to Redis: key=" + key + ", value=" + value;
             logger.error(message, e);
