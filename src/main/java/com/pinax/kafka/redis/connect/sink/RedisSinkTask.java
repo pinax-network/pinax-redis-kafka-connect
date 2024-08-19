@@ -23,8 +23,8 @@ public class RedisSinkTask extends SinkTask {
 
     private Set<String> sentinels = new HashSet<String>();
 
-    private Jedis jedis = null;
     private JedisSentinelPool jedisSentinelPool = null;
+    private Jedis jedis = null;
     private Pipeline jedisPipeline = null;
 
     private List<String> redisHosts;
@@ -86,13 +86,13 @@ public class RedisSinkTask extends SinkTask {
                 logger.debug("Record written to Redis: key={}, value={}", key, value);
             }
 
+            jedisPipeline.sync();
+
         } catch (Exception e) {
             final String message = "Failed to write record to Redis: key=" + key + ", value=" + value;
             logger.error(message, e);
             throw new RetriableException(message, e);
         }
-
-        jedisPipeline.sync();
     }
 
     @Override
@@ -105,7 +105,7 @@ public class RedisSinkTask extends SinkTask {
             jedis.close();
         }
         if (jedisSentinelPool != null) {
-            jedisSentinelPool.destroy();
+            jedisSentinelPool.close();
         }
     }
 
