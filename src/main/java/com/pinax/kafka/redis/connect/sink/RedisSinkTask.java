@@ -4,6 +4,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.HashSet;
 
 import org.apache.kafka.common.config.AbstractConfig;
 import org.apache.kafka.connect.errors.RetriableException;
@@ -20,7 +21,7 @@ import redis.clients.jedis.Pipeline;
 public class RedisSinkTask extends SinkTask {
     private final Logger logger = LoggerFactory.getLogger(RedisSinkConnector.class);
 
-    private Set<String> sentinels = null;
+    private Set<String> sentinels = new HashSet<String>();
 
     private Jedis jedis = null;
     private JedisSentinelPool jedisSentinelPool = null;
