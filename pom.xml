@@ -68,6 +68,12 @@
         <plugin>
           <artifactId>maven-jar-plugin</artifactId>
           <version>3.0.2</version>
+          <executions>
+            <execution>
+                <id>default-jar</id>
+                <phase>none</phase>
+            </execution>
+          </executions>
         </plugin>
 
         <plugin>
@@ -99,6 +105,8 @@
             <descriptorRefs>
               <descriptorRef>jar-with-dependencies</descriptorRef>
             </descriptorRefs>
+            <finalName>pinax-redis-kafka-connect</finalName>
+            <appendAssemblyId>false</appendAssemblyId>
           </configuration>
           <executions>
             <execution>

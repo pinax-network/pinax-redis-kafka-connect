@@ -30,6 +30,32 @@ public class RedisSinkTask extends SinkTask {
     private List<String> redisHosts;
     private String redisMaster;
 
+    private void createRedisConnection() {
+        try {
+            jedisSentinelPool = new JedisSentinelPool(redisMaster, sentinels);
+            jedis = jedisSentinelPool.getResource();
+            jedisPipeline = jedis.pipelined();
+
+            logger.info("Redis connection created");
+        } catch (Exception e) {
+            logger.error("Failed to create Redis connection", e);
+        }
+    }
+
+    private void closeRedisConnection() {
+        if (jedisPipeline != null) {
+            jedisPipeline.close();
+        }
+        if (jedis != null) {
+            jedis.close();
+        }
+        if (jedisSentinelPool != null) {
+            jedisSentinelPool.close();
+        }
+
+        logger.info("Redis connection closed");
+    }
+
     @Override
     public void start(Map<String, String> properties) {
         logger.info("Starting Redis sink task {}", properties);
@@ -40,20 +66,11 @@ public class RedisSinkTask extends SinkTask {
         redisHosts = config.getList(RedisSinkConfig.HOSTS);
         redisMaster = config.getString(RedisSinkConfig.MASTER);
 
-        try {
-
-            for (String redisHostPort : redisHosts) {
-                sentinels.add(redisHostPort);
-            }
-
-            jedisSentinelPool = new JedisSentinelPool(redisMaster, sentinels);
-            jedis = jedisSentinelPool.getResource();
-            jedisPipeline = jedis.pipelined();
-
-            logger.info("Redis connection created");
-        } catch (Exception e) {
-            logger.error("Failed to create Redis connection", e);
+        for (String redisHostPort : redisHosts) {
+            sentinels.add(redisHostPort);
         }
+
+        createRedisConnection();
     }
 
     @Override
@@ -88,9 +105,14 @@ public class RedisSinkTask extends SinkTask {
 
             jedisPipeline.sync();
 
-        } catch (Exception e) {
+        } catch (Exception e) { // TODO: Handle connections errors separately from data errors
             final String message = "Failed to write record to Redis: key=" + key + ", value=" + value;
             logger.error(message, e);
+
+            // Reconnect to Redis and retry
+            closeRedisConnection();
+            createRedisConnection();
+
             throw new RetriableException(message, e);
         }
     }
@@ -98,15 +120,7 @@ public class RedisSinkTask extends SinkTask {
     @Override
     public void stop() {
         logger.info("Stopping Redis sink task");
-        if (jedisPipeline != null) {
-            jedisPipeline.close();
-        }
-        if (jedis != null) {
-            jedis.close();
-        }
-        if (jedisSentinelPool != null) {
-            jedisSentinelPool.close();
-        }
+        closeRedisConnection();
     }
 
     @Override
