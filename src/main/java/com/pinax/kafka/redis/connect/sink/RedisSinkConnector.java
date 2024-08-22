@@ -12,7 +12,7 @@ import org.slf4j.LoggerFactory;
 
 public class RedisSinkConnector extends SinkConnector {
 
-    protected static final String VERSION = "0.0.1";
+    protected static final String VERSION = "0.0.1"; // TODO: Get artifact version from pom.xml
 
     private final Logger logger = LoggerFactory.getLogger(RedisSinkConnector.class);
 
