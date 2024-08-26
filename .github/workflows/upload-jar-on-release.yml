@@ -36,7 +36,7 @@ jobs:
       - name: Dispatch build event
         uses: peter-evans/repository-dispatch@v3
         with:
-          token: ${{ secrets.PINAX_CONNECT_TOKEN }}
+          token: ${{ secrets.PAT }}
           repository: ${{ env.PINAX_CONNECT_REPO }}
           event-type: build-push-image
           client-payload: '{"ref": "${{ github.ref }}"}'
