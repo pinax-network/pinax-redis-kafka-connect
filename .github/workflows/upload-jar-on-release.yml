@@ -4,6 +4,9 @@ on:
   release:
     types: [created]
 
+env:
+  PINAX_CONNECT_REPO: pinax-network/pinax-connect
+
 jobs:
   build-and-upload:
     runs-on: ubuntu-latest
@@ -29,3 +32,11 @@ jobs:
           asset_content_type: application/java-archive
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Dispatch build event
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.PINAX_CONNECT_TOKEN }}
+          repository: ${{ env.PINAX_CONNECT_REPO }}
+          event-type: build-image
+          client-payload: '{"ref": "${{ github.ref }}"}'
