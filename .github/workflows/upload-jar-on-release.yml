@@ -38,5 +38,5 @@ jobs:
         with:
           token: ${{ secrets.PINAX_CONNECT_TOKEN }}
           repository: ${{ env.PINAX_CONNECT_REPO }}
-          event-type: build-image
+          event-type: build-push-image
           client-payload: '{"ref": "${{ github.ref }}"}'
