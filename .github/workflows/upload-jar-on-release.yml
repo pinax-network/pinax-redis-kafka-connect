@@ -23,16 +23,6 @@ jobs:
       - name: Build the project
         run: mvn clean package
 
-      # - name: Upload Release Asset
-      #   uses: actions/upload-release-asset@v1
-      #   with:
-      #     upload_url: ${{ github.event.release.upload_url }}
-      #     asset_path: target/pinax-redis-kafka-connect.jar
-      #     asset_name: pinax-redis-kafka-connect.jar
-      #     asset_content_type: application/java-archive
-      #   env:
-      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Create Release Asset
         id: create_release_asset
         env:
@@ -45,4 +35,4 @@ jobs:
           token: ${{ secrets.PAT }}
           repository: ${{ env.PINAX_CONNECT_REPO }}
           event-type: build-push-image
-          # client-payload: '{"ref": "${{ github.ref }}", "sha": "${{ github.sha }}"}'
+          client-payload: '{"tag": "${{ github.event.release.tag_name }}"}'
