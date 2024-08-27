@@ -45,4 +45,4 @@ jobs:
           token: ${{ secrets.PAT }}
           repository: ${{ env.PINAX_CONNECT_REPO }}
           event-type: build-push-image
-          client-payload: '{"ref": "${{ github.ref }}", "sha": "${{ github.sha }}"}'
+          # client-payload: '{"ref": "${{ github.ref }}", "sha": "${{ github.sha }}"}'
