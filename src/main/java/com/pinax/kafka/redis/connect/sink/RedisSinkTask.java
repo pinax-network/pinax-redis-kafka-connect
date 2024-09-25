@@ -60,6 +60,11 @@ public class RedisSinkTask extends SinkTask {
         logger.info("Redis connection closed");
     }
 
+    private void reconnectToRedis() {
+        closeRedisConnection();
+        createRedisConnection();
+    }
+
     @Override
     public void start(Map<String, String> properties) {
         logger.info("Starting Redis sink task {}", properties);
