@@ -17,6 +17,10 @@ import org.slf4j.LoggerFactory;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisSentinelPool;
 import redis.clients.jedis.Pipeline;
+import redis.clients.jedis.exceptions.JedisAccessControlException;
+import redis.clients.jedis.exceptions.JedisConnectionException;
+import redis.clients.jedis.exceptions.JedisDataException;
+import redis.clients.jedis.exceptions.JedisException;
 
 public class RedisSinkTask extends SinkTask {
     private final Logger logger = LoggerFactory.getLogger(RedisSinkConnector.class);
@@ -82,13 +86,13 @@ public class RedisSinkTask extends SinkTask {
         String key = null;
         String value = null;
 
-        try {
-            for (SinkRecord record : records) {
+        for (SinkRecord record : records) {
+            try {
                 logger.debug("Processing record: {}", record);
                 key = record.key() == null ? "" : record.key().toString();
                 value = record.value() == null ? "" : record.value().toString();
 
-                // value:expireAt
+                // value:expireAt (should be good since it's validated in the config)
                 String[] parts = value.split(":");
                 if (parts.length != 2) {
                     throw new DataException("Invalid value format: " + value);
@@ -101,22 +105,33 @@ public class RedisSinkTask extends SinkTask {
                 jedisPipeline.expireAt(key, expireAtValue);
 
                 logger.debug("Record written to Redis: key={}, value={}", key, value);
+            } catch (JedisConnectionException e) {
+                logger.error("Redis connection error", e);
+                reconnectToRedis();
+                throw new RetriableException("Redis connection error", e);
+            } catch (JedisAccessControlException e) {
+                logger.error("Redis access control error", e);
+                reconnectToRedis();
+                throw new RetriableException("Redis access control error", e);
+            } catch (Exception e) {
+                logger.error("Data or parsing error", e);
+                throw new DataException("Data or parsing error", e);
             }
+        }
 
+        try {
             jedisPipeline.sync();
-
+        } catch (JedisConnectionException e) {
+            logger.error("Redis connection error", e);
+            reconnectToRedis();
+            throw new RetriableException("Redis connection error", e);
+        } catch (JedisAccessControlException e) {
+            logger.error("Redis access control error", e);
+            reconnectToRedis();
+            throw new RetriableException("Redis access control error", e);
         } catch (Exception e) {
-            // TODO: Handle connections errors separately from data errors
-            // (use DataException)
-
-            final String message = "Failed to write record to Redis: key=" + key + ", value=" + value;
-            logger.error(message, e);
-
-            // Reconnect to Redis and retry
-            closeRedisConnection();
-            createRedisConnection();
-
-            throw new RetriableException(message, e);
+            logger.error("Data or parsing error", e);
+            throw new DataException("Data or parsing error", e);
         }
     }
 
