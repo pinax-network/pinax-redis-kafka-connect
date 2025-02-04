@@ -1,49 +1,64 @@
 package com.pinax.kafka.redis.connect.sink;
 
-import org.simplejavamail.MailException;
-import org.simplejavamail.api.email.Email;
-import org.simplejavamail.api.mailer.Mailer;
-import org.simplejavamail.email.EmailBuilder;
-import org.simplejavamail.mailer.MailerBuilder;
+import java.io.IOException;
+
+import org.apache.hc.client5.http.classic.methods.HttpPost;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.impl.classic.HttpClientBuilder;
+import org.apache.hc.core5.http.HttpEntity;
+import org.apache.hc.core5.http.io.entity.EntityUtils;
+import org.apache.hc.core5.http.io.entity.StringEntity;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class MailSender {
+    private final Logger logger = LoggerFactory.getLogger(RedisSinkConnector.class);
 
-    private Mailer mailer = null;
-    private Email email = null;
+    private final String from;
+    private final String mailChimpApiKey;
+    private final String templateSlug;
 
-    MailSender(String from, String to, String host, int port, String username, String password) {
-        initMailer(host, port, username, password);
-        initEmail(from, to);
+    private static final String MAILCHIMP_API_URL = "https://mandrillapp.com/api/1.0/messages/send-template";
+
+    MailSender(String from, String mailChimpApiKey, String templateSlug) {
+        this.from = from;
+        this.mailChimpApiKey = mailChimpApiKey;
+        this.templateSlug = templateSlug;
     }
 
-    private void initMailer(String host, int port, String username, String password) {
-        // Initialize mailer
-        mailer = MailerBuilder
-                .withSMTPServer(host, port, username, password)
-                .buildMailer();
-
+    // Formats the mail content to fit with the template params
+    private String toMergeVars(MailContent mailContent) {
+        return "[{\"name\":\"fullname\", \"content\":\"" + mailContent.getFullname() + "\"}, {\"name\":\"usage\", \"content\":\"" + mailContent.getUsage() + "\"}]";
     }
 
-    private void initEmail(String from, String to) {
-        // Initialize email
-        email = EmailBuilder.startingBlank()
-                .from(from)
-                .to(to)
-                .buildEmail();
-    }
+    public void SendUsageMail(String to, String subject, MailContent mailContent) {
+        String mailTemplateContent = toMergeVars(mailContent);
 
-    public void SendUsageMail() {
-        // Send mail
-        boolean isEmailValid = mailer.validate(email);
+        // 2. Send mail and handle exceptions
+        CloseableHttpClient httpClient = HttpClientBuilder.create().build();
+        HttpPost httpPost = new HttpPost(MAILCHIMP_API_URL);
 
-        if (isEmailValid) {
-            try {
-                // TODO: send email
-            } catch (MailException e) {
-                // TODO: throw exception
-            }
-        } else {
-            // TODO: throw exception
+        final String json = "{\"key\": \"" + this.mailChimpApiKey + "\", \"template_name\": \""+ this.templateSlug +"\", \"template_content\": " + mailTemplateContent + ", \"message\": {\"to\": [{\"email\":\""+ to +"\",\"type\":\"to\"}],\"from_email\":\""+ this.from +"\",\"subject\":\"" + subject + "\", \"global_merge_vars\": " + mailTemplateContent + "}}";
+        final StringEntity stringEntity = new StringEntity(json);
+        httpPost.setEntity(stringEntity);
+        httpPost.setHeader("Accept", "application/json");
+        httpPost.setHeader("Content-type", "application/json");
+
+        try {
+            httpClient.execute(httpPost, response -> {
+                int status = response.getCode();
+                if (status >= 200 && status < 300) {
+                    HttpEntity entity = response.getEntity();
+                    logger.info("Mail sent successfully to: " + to + ", {}", mailContent);
+                    return entity;
+                } else {
+                    HttpEntity entity = response.getEntity();
+                    String responseString = EntityUtils.toString(entity);
+                    throw new IOException("Failed to send mail to: " + to + ", " + responseString);
+                }
+            });
+        } catch (IOException e) {
+            e.printStackTrace();
         }
     }
 }

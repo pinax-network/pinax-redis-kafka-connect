@@ -19,8 +19,6 @@ import redis.clients.jedis.JedisSentinelPool;
 import redis.clients.jedis.Pipeline;
 import redis.clients.jedis.exceptions.JedisAccessControlException;
 import redis.clients.jedis.exceptions.JedisConnectionException;
-import redis.clients.jedis.exceptions.JedisDataException;
-import redis.clients.jedis.exceptions.JedisException;
 
 public class RedisSinkTask extends SinkTask {
     private final Logger logger = LoggerFactory.getLogger(RedisSinkConnector.class);
@@ -30,6 +28,8 @@ public class RedisSinkTask extends SinkTask {
     private JedisSentinelPool jedisSentinelPool = null;
     private Jedis jedis = null;
     private Pipeline jedisPipeline = null;
+
+    private MailSender mailSender = null;
 
     private List<String> redisHosts;
     private String redisMaster;
@@ -74,6 +74,13 @@ public class RedisSinkTask extends SinkTask {
         // Prepare Redis connection
         redisHosts = config.getList(RedisSinkConfig.HOSTS);
         redisMaster = config.getString(RedisSinkConfig.MASTER);
+
+        // Prepare email sender
+        mailSender = new MailSender(
+            config.getString(RedisSinkConfig.FROM),
+            config.getString(RedisSinkConfig.MAILCHIMP_API_KEY),
+            config.getString(RedisSinkConfig.TEMPLATE_SLUG)
+        );
 
         for (String redisHostPort : redisHosts) {
             sentinels.add(redisHostPort);
@@ -122,6 +129,12 @@ public class RedisSinkTask extends SinkTask {
                 logger.error("Data or parsing error", e);
                 throw new DataException("Data or parsing error", e);
             }
+
+            // TODO: Send usage notification email if usage is close to the limit
+            // if (false) {
+            //     MailContent mailContent = new MailContent(fullname, usage);
+            //     mailSender.SendUsageMail(to, subject, mailContent);
+            // } 
         }
 
         try {
