@@ -27,12 +27,12 @@ public class MailSender {
     }
 
     // Formats the mail content to fit with the template params
-    private String toMergeVars(MailContent mailContent) {
+    private String formatTemplateContent(MailContent mailContent) {
         return "[{\"name\":\"fullname\", \"content\":\"" + mailContent.getFullname() + "\"}, {\"name\":\"usage\", \"content\":\"" + mailContent.getUsage() + "\"}]";
     }
 
     public void SendUsageMail(String to, String subject, MailContent mailContent) {
-        String mailTemplateContent = toMergeVars(mailContent);
+        String mailTemplateContent = formatTemplateContent(mailContent);
 
         // 2. Send mail and handle exceptions
         CloseableHttpClient httpClient = HttpClientBuilder.create().build();
