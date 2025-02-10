@@ -4,33 +4,46 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 public class MailContent {
-    private String fullname;
-    private int usage;
+    private String teamName;
+    private String teamPlan;
+    private Double billedCredits;
+    private Integer includedCredits;
+    private Integer creditCutoff;
 
-    public MailContent(String fullname, int usage) {
-        this.fullname = fullname;
-        this.usage = usage;
+    public MailContent(String teamName, String teamPlan, Double billedCredits, Integer includedCredits, Integer creditCutoff) {
+        this.teamName = teamName;
+        this.teamPlan = teamPlan;
+        this.billedCredits = billedCredits;
+        this.includedCredits = includedCredits;
+        this.creditCutoff = creditCutoff;
     }
 
-    public String getFullname() {
-        return fullname;
+    public String getTeamName() {
+        return teamName;
     }
 
-    public int getUsage() {
-        return usage;
+    public String getTeamPlan() {
+        return teamPlan;
     }
 
-    public void setFullname(String fullname) {
-        this.fullname = fullname;
+    public Double getBilledCredits() {
+        return billedCredits;
     }
 
-    public void setUsage(int usage) {
-        this.usage = usage;
+    public Integer getIncludedCredits() {
+        return includedCredits;
+    }
+
+    public Integer getCreditCutoff() {
+        return creditCutoff;
     }
 
     public JSONArray toJSONArray() {
         return new JSONArray()
-                .put(new JSONObject().put("name", "fullname").put("content", this.fullname))
-                .put(new JSONObject().put("name", "usage").put("content", this.usage));
+                .put(new JSONObject().put("name", "teamname").put("content", this.teamName))
+                .put(new JSONObject().put("name", "teamplan").put("content", this.teamPlan))
+                .put(new JSONObject().put("name", "billedcredits").put("content", this.billedCredits))
+                .put(new JSONObject().put("name", "includedcredits").put("content", this.includedCredits))
+                .put(new JSONObject().put("name", "creditcutoff").put("content", this.creditCutoff));
     }
 }

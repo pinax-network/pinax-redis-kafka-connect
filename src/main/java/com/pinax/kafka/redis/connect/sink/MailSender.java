@@ -15,7 +15,7 @@ import org.slf4j.LoggerFactory;
 
 public class MailSender {
     private final Logger logger = LoggerFactory.getLogger(RedisSinkConnector.class);
-    
+
     private static final String MAILCHIMP_API_URL = "https://mandrillapp.com/api/1.0/messages/send-template";
 
     private final String from;
@@ -46,10 +46,8 @@ public class MailSender {
 
         return json;
     }
-        
 
-    public void SendUsageMail(String to, String subject, MailContent mailContent) {
-        CloseableHttpClient httpClient = HttpClientBuilder.create().build();
+    public HttpPost CreateUsageMailRequest(String to, String subject, MailContent mailContent) {
         HttpPost httpPost = new HttpPost(MAILCHIMP_API_URL);
 
         JSONObject body = prepareBody(to, subject, mailContent);
@@ -58,17 +56,23 @@ public class MailSender {
         httpPost.setHeader("Accept", "application/json");
         httpPost.setHeader("Content-type", "application/json");
 
+        return httpPost;
+    }
+        
+    public void SendUsageMailRequest(HttpPost usageMailRequest) {
+        CloseableHttpClient httpClient = HttpClientBuilder.create().build();
+
         try {
-            httpClient.execute(httpPost, response -> {
+            httpClient.execute(usageMailRequest, response -> {
                 int status = response.getCode();
                 if (status >= 200 && status < 300) {
                     HttpEntity entity = response.getEntity();
-                    logger.info("Mail sent successfully to: " + to + ", {}", mailContent);
+                    logger.info("Usage mail sent successfully");
                     return entity;
                 } else {
                     HttpEntity entity = response.getEntity();
                     String responseString = EntityUtils.toString(entity);
-                    throw new IOException("Failed to send mail to: " + to + ", " + responseString);
+                    throw new IOException("Failed to send usage mail: " + responseString);
                 }
             });
         } catch (IOException e) {
