@@ -19,6 +19,10 @@ jobs:
         with:
           distribution: 'adopt'
           java-version: '11'
+      
+      - name: Set short sha
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short ${{ github.sha }})" >> $GITHUB_OUTPUT
 
       - name: Build the project
         run: mvn clean package
@@ -35,4 +39,4 @@ jobs:
           token: ${{ secrets.PAT }}
           repository: ${{ env.PINAX_CONNECT_REPO }}
           event-type: build-push-image
-          client-payload: '{"tag": "${{ github.event.release.tag_name }}"}'
+          client-payload: '{"tag": "${{ github.event.release.tag_name }}", "sha_short": "${{ steps.vars.outputs.sha_short }}"}'
