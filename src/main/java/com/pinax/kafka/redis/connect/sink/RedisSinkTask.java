@@ -5,6 +5,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.HashSet;
 
 import org.apache.hc.client5.http.classic.methods.HttpPost;
@@ -202,13 +203,24 @@ public class RedisSinkTask extends SinkTask {
             throw new DataException("Data or parsing error", e);
         }
 
+        List<CompletableFuture<Void>> futures = new ArrayList<CompletableFuture<Void>>();
         mailRequests.forEach(mailRequest -> {
-            try {
-                mailSender.SendUsageMailRequest(mailRequest); // TODO: Make this async
-            } catch (Exception e) {
-                logger.error("Failed to send mail", e);
-            }
+            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                try {
+                    mailSender.SendUsageMailRequest(mailRequest);
+                } catch (Exception e) {
+                    logger.error("Failed to send mail", e);
+                }
+            });
+            futures.add(future);
         });
+
+        CompletableFuture<Void> allFutures = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+        try {
+            allFutures.get();
+        } catch (Exception e) {
+            logger.error("Failed to complete all mail requests", e);
+        }
     }
 
     @Override
