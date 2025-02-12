@@ -143,63 +143,7 @@ public class RedisSinkTask extends SinkTask {
         try {
             jedisPipeline.sync();
 
-            // Prepare mail requests
-            for (int i = 0; i < records.size(); i++) {
-                JSONObject json = jsonObjects.get(i);
-                Response<Double> newBilledCreditsResponse = newBilledCreditsResponses.get(i);
-
-                double billedCredits = json.getDouble("billed_credits");
-                String teamBillingEmail = json.getString("team_billing_email");
-                String teamName = json.getString("team_name");
-                String teamPlan = json.getString("team_plan");
-                Integer includedCredits = json.getInt("included_credits");
-                Integer creditCutoff = json.getInt("credit_cutoff");
-
-                double newBilledCredits = newBilledCreditsResponse.get();
-                double oldBilledCredits = newBilledCreditsResponse.get() - billedCredits;
-
-                if (creditCutoff > 0) {
-
-                    List<Double> creditThresholds = new ArrayList<Double>();
-                    creditThresholds.add(creditCutoff * 0.50);
-                    creditThresholds.add(creditCutoff * 0.75);
-                    creditThresholds.add(creditCutoff * 0.90);
-                    creditThresholds.add(creditCutoff * 1.00);
-
-                    for (Double creditThreshold : creditThresholds) {
-                        if (oldBilledCredits < creditThreshold && newBilledCredits >= creditThreshold) {
-                            MailContent mailContent = new MailContent(teamName, teamPlan,
-                                    newBilledCredits,
-                                    includedCredits, creditCutoff);
-                            mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
-                                    "Cut Off Credits Email", mailContent)); // TODO: Change the mail subject
-                            break;
-                        }
-                    }
-                }
-
-                if (includedCredits > 0 && includedCredits != creditCutoff) {
-
-                    List<Double> creditThresholds = new ArrayList<Double>();
-                    creditThresholds.add(includedCredits * 0.50);
-                    creditThresholds.add(includedCredits * 0.75);
-                    creditThresholds.add(includedCredits * 0.90);
-                    creditThresholds.add(includedCredits * 1.00);
-                    creditThresholds.add(includedCredits * 1.50);
-                    creditThresholds.add(includedCredits * 2.00);
-
-                    for (Double creditThreshold : creditThresholds) {
-                        if (oldBilledCredits < creditThreshold && newBilledCredits >= creditThreshold) {
-                            MailContent mailContent = new MailContent(teamName, teamPlan,
-                                    newBilledCredits,
-                                    includedCredits, creditCutoff);
-                            mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
-                                    "Included Credits Email", mailContent)); // TODO: Change the mail subject
-                            break;
-                        }
-                    }
-                }
-            }
+            mailRequests = prepareMailRequests(jsonObjects, newBilledCreditsResponses);
         } catch (JedisConnectionException e) {
             logger.error("Redis connection error", e);
             reconnectToRedis();
@@ -231,6 +175,71 @@ public class RedisSinkTask extends SinkTask {
         } catch (Exception e) {
             logger.error("Failed to complete all mail requests", e);
         }
+    }
+
+    private List<HttpPost> prepareMailRequests(List<JSONObject> jsonObjects,
+            List<Response<Double>> newBilledCreditsResponses) {
+        List<HttpPost> mailRequests = new ArrayList<HttpPost>();
+
+        // Prepare mail requests
+        for (int i = 0; i < jsonObjects.size(); i++) {
+            JSONObject json = jsonObjects.get(i);
+            Response<Double> newBilledCreditsResponse = newBilledCreditsResponses.get(i);
+
+            double billedCredits = json.getDouble("billed_credits");
+            String teamBillingEmail = json.getString("team_billing_email");
+            String teamName = json.getString("team_name");
+            String teamPlan = json.getString("team_plan");
+            Integer includedCredits = json.getInt("included_credits");
+            Integer creditCutoff = json.getInt("credit_cutoff");
+
+            double newBilledCredits = newBilledCreditsResponse.get();
+            double oldBilledCredits = newBilledCreditsResponse.get() - billedCredits;
+
+            if (creditCutoff > 0) {
+
+                List<Double> creditThresholds = new ArrayList<Double>();
+                creditThresholds.add(creditCutoff * 0.50);
+                creditThresholds.add(creditCutoff * 0.75);
+                creditThresholds.add(creditCutoff * 0.90);
+                creditThresholds.add(creditCutoff * 1.00);
+
+                for (Double creditThreshold : creditThresholds) {
+                    if (oldBilledCredits < creditThreshold && newBilledCredits >= creditThreshold) {
+                        MailContent mailContent = new MailContent(teamName, teamPlan,
+                                newBilledCredits,
+                                includedCredits, creditCutoff);
+                        mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
+                                "Cut Off Credits Email", mailContent)); // TODO: Change the mail subject
+                        break;
+                    }
+                }
+            }
+
+            if (includedCredits > 0 && includedCredits != creditCutoff) {
+
+                List<Double> creditThresholds = new ArrayList<Double>();
+                creditThresholds.add(includedCredits * 0.50);
+                creditThresholds.add(includedCredits * 0.75);
+                creditThresholds.add(includedCredits * 0.90);
+                creditThresholds.add(includedCredits * 1.00);
+                creditThresholds.add(includedCredits * 1.50);
+                creditThresholds.add(includedCredits * 2.00);
+
+                for (Double creditThreshold : creditThresholds) {
+                    if (oldBilledCredits < creditThreshold && newBilledCredits >= creditThreshold) {
+                        MailContent mailContent = new MailContent(teamName, teamPlan,
+                                newBilledCredits,
+                                includedCredits, creditCutoff);
+                        mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
+                                "Included Credits Email", mailContent)); // TODO: Change the mail subject
+                        break;
+                    }
+                }
+            }
+        }
+
+        return mailRequests;
     }
 
     @Override
