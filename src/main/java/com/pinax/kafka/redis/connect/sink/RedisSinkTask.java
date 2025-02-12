@@ -14,6 +14,7 @@ import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
+import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -109,19 +110,15 @@ public class RedisSinkTask extends SinkTask {
                 key = record.key() == null ? "" : record.key().toString();
                 value = record.value() == null ? "" : record.value().toString();
 
-                // billedCredits:expirationTimestamp:teamName:teamPlan:IncludedCredits:creditCutoff
-                String[] parts = value.split(":");
-                if (parts.length < 7) {
-                    throw new DataException("Invalid value format: " + value);
-                }
+                JSONObject json = new JSONObject(value);
 
-                double billedCredits = Double.parseDouble(parts[0]);
-                long expireAtValue = Long.parseLong(parts[1]);
-                String teamBillingEmail = parts[2];
-                String teamName = parts[3];
-                String teamPlan = parts[4];
-                Integer includedCredits = Integer.parseInt(parts[5]);
-                Integer creditCutoff = Integer.parseInt(parts[6]);
+                double billedCredits = json.getDouble("billed_credits");
+                long expireAtValue = json.getLong("expiration");
+                String teamBillingEmail = json.getString("team_billing_email");
+                String teamName = json.getString("team_name");
+                String teamPlan = json.getString("team_plan");
+                Integer includedCredits = json.getInt("included_credits");
+                Integer creditCutoff = json.getInt("credit_cutoff");
 
                 Response<Double> newBilledCredits = jedisPipeline.incrByFloat(key, billedCredits);
                 jedisPipeline.expireAt(key, expireAtValue);
