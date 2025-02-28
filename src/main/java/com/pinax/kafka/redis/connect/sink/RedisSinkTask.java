@@ -206,11 +206,10 @@ public class RedisSinkTask extends SinkTask {
 
                 for (Double creditThreshold : creditThresholds) {
                     if (oldBilledCredits < creditThreshold && newBilledCredits >= creditThreshold) {
-                        MailContent mailContent = new MailContent(teamName, teamPlan,
-                                newBilledCredits,
-                                includedCredits, creditCutoff);
+                        MailContent mailContent = new MailContent(teamName, teamPlan, newBilledCredits,
+                                includedCredits);
                         mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
-                                "Cut Off Credits Email", mailContent)); // TODO: Change the mail subject
+                                "An Update on your Monthly Usage", mailContent)); // TODO: Change the mail subject
                         break;
                     }
                 }
@@ -228,11 +227,10 @@ public class RedisSinkTask extends SinkTask {
 
                 for (Double creditThreshold : creditThresholds) {
                     if (oldBilledCredits < creditThreshold && newBilledCredits >= creditThreshold) {
-                        MailContent mailContent = new MailContent(teamName, teamPlan,
-                                newBilledCredits,
-                                includedCredits, creditCutoff);
+                        MailContent mailContent = new MailContent(teamName, teamPlan, newBilledCredits,
+                                includedCredits);
                         mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
-                                "Included Credits Email", mailContent)); // TODO: Change the mail subject
+                                "An Update on your Monthly Usage", mailContent)); // TODO: Change the mail subject
                         break;
                     }
                 }
