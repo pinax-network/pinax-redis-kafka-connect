@@ -196,24 +196,27 @@ public class RedisSinkTask extends SinkTask {
             double newBilledCredits = newBilledCreditsResponse.get();
             double oldBilledCredits = newBilledCreditsResponse.get() - billedCredits;
 
-            if (creditCutoff > 0) {
+            // if (creditCutoff > 0) {
 
-                List<Double> creditThresholds = new ArrayList<Double>();
-                creditThresholds.add(creditCutoff * 0.50);
-                creditThresholds.add(creditCutoff * 0.75);
-                creditThresholds.add(creditCutoff * 0.90);
-                creditThresholds.add(creditCutoff * 1.00);
+            // List<Double> creditThresholds = new ArrayList<Double>();
+            // creditThresholds.add(creditCutoff * 0.50);
+            // creditThresholds.add(creditCutoff * 0.75);
+            // creditThresholds.add(creditCutoff * 0.90);
+            // creditThresholds.add(creditCutoff * 1.00);
 
-                for (Double creditThreshold : creditThresholds) {
-                    if (oldBilledCredits < creditThreshold && newBilledCredits >= creditThreshold) {
-                        MailContent mailContent = new MailContent(teamName, teamPlan, newBilledCredits,
-                                includedCredits);
-                        mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
-                                "An Update on your Monthly Usage", mailContent)); // TODO: Change the mail subject
-                        break;
-                    }
-                }
-            }
+            // for (Double creditThreshold : creditThresholds) {
+            // if (oldBilledCredits < creditThreshold && newBilledCredits >=
+            // creditThreshold) {
+            // MailContent mailContent = new MailContent(teamName, teamPlan,
+            // newBilledCredits,
+            // includedCredits);
+            // mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
+            // "An Update on your Monthly Usage", mailContent)); // TODO: Change the mail
+            // subject
+            // break;
+            // }
+            // }
+            // }
 
             if (includedCredits > 0 && includedCredits != creditCutoff) {
 
@@ -227,6 +230,7 @@ public class RedisSinkTask extends SinkTask {
 
                 for (Double creditThreshold : creditThresholds) {
                     if (oldBilledCredits < creditThreshold && newBilledCredits >= creditThreshold) {
+                        newBilledCredits = Math.round(newBilledCredits * 100.0) / 100.0;
                         MailContent mailContent = new MailContent(teamName, teamPlan, newBilledCredits,
                                 includedCredits);
                         mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
