@@ -1,8 +1,12 @@
 package com.pinax.kafka.redis.connect.sink;
 
+import java.text.DecimalFormat;
+import java.text.DecimalFormatSymbols;
+import java.text.NumberFormat;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -228,11 +232,19 @@ public class RedisSinkTask extends SinkTask {
                 creditThresholds.add(includedCredits * 1.50);
                 creditThresholds.add(includedCredits * 2.00);
 
+                // Format to currency and remove currency symbol
+                DecimalFormat formatter = (DecimalFormat) NumberFormat.getCurrencyInstance(Locale.US);
+                DecimalFormatSymbols symbols = formatter.getDecimalFormatSymbols();
+                symbols.setCurrencySymbol("");
+                formatter.setDecimalFormatSymbols(symbols);
+
                 for (Double creditThreshold : creditThresholds) {
                     if (oldBilledCredits < creditThreshold && newBilledCredits >= creditThreshold) {
-                        newBilledCredits = Math.round(newBilledCredits * 100.0) / 100.0;
-                        MailContent mailContent = new MailContent(teamName, teamPlan, newBilledCredits,
-                                includedCredits);
+                        String newBilledCreditsString = formatter.format(newBilledCredits);
+                        String includedCreditsString = formatter.format(includedCredits);
+
+                        MailContent mailContent = new MailContent(teamName, teamPlan, newBilledCreditsString,
+                                includedCreditsString);
                         mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
                                 "An Update on your Monthly Usage", mailContent)); // TODO: Change the mail subject
                         break;

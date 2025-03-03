@@ -6,10 +6,10 @@ import org.json.JSONObject;
 public class MailContent {
     private String teamName;
     private String teamPlan;
-    private Double billedCredits;
-    private Integer includedCredits;
+    private String billedCredits;
+    private String includedCredits;
 
-    public MailContent(String teamName, String teamPlan, Double billedCredits, Integer includedCredits) {
+    public MailContent(String teamName, String teamPlan, String billedCredits, String includedCredits) {
         this.teamName = teamName;
         this.teamPlan = teamPlan;
         this.billedCredits = billedCredits;
@@ -24,11 +24,11 @@ public class MailContent {
         return teamPlan;
     }
 
-    public Double getBilledCredits() {
+    public String getBilledCredits() {
         return billedCredits;
     }
 
-    public Integer getIncludedCredits() {
+    public String getIncludedCredits() {
         return includedCredits;
     }
 
