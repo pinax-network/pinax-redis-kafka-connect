@@ -240,8 +240,8 @@ public class RedisSinkTask extends SinkTask {
 
                 for (Double creditThreshold : creditThresholds) {
                     if (oldBilledCredits < creditThreshold && newBilledCredits >= creditThreshold) {
-                        String newBilledCreditsString = formatter.format(newBilledCredits);
-                        String includedCreditsString = formatter.format(includedCredits);
+                        String newBilledCreditsString = formatter.format(newBilledCredits / 100);
+                        String includedCreditsString = formatter.format(includedCredits / 100);
 
                         MailContent mailContent = new MailContent(teamName, teamPlan, newBilledCreditsString,
                                 includedCreditsString);
