@@ -162,7 +162,11 @@ public class RedisSinkTask extends SinkTask {
         }
 
         List<CompletableFuture<Void>> futures = new ArrayList<CompletableFuture<Void>>();
-        logger.info("Sending usage mail requests: {}", mailRequests.size());
+
+        if (mailRequests.size() > 0) {
+            logger.info("Sending usage mail requests: {}", mailRequests.size());
+        }
+
         mailRequests.forEach(mailRequest -> {
             CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
                 try {
