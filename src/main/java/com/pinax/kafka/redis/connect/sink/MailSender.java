@@ -22,7 +22,6 @@ public class MailSender {
     private final String mailChimpApiKey;
     private final String templateSlug;
 
-
     MailSender(String from, String mailChimpApiKey, String templateSlug) {
         this.from = from;
         this.mailChimpApiKey = mailChimpApiKey;
@@ -58,7 +57,7 @@ public class MailSender {
 
         return httpPost;
     }
-        
+
     public void SendUsageMailRequest(HttpPost usageMailRequest) {
         CloseableHttpClient httpClient = HttpClientBuilder.create().build();
 
