@@ -294,6 +294,9 @@ public class RedisSinkTask extends SinkTask {
     public void stop() {
         logger.info("Stopping Redis sink task");
         closeRedisConnection();
+        if (mailSender != null) {
+            mailSender.close();
+        }
     }
 
     @Override
