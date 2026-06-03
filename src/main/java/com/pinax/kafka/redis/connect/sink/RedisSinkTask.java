@@ -14,6 +14,7 @@ import java.util.HashSet;
 
 import org.apache.hc.client5.http.classic.methods.HttpPost;
 import org.apache.kafka.common.config.AbstractConfig;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.sink.SinkRecord;
@@ -26,7 +27,8 @@ import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisSentinelPool;
 import redis.clients.jedis.Pipeline;
 import redis.clients.jedis.exceptions.JedisAccessControlException;
-import redis.clients.jedis.exceptions.JedisConnectionException;
+import redis.clients.jedis.exceptions.JedisDataException;
+import redis.clients.jedis.exceptions.JedisException;
 import redis.clients.jedis.Response;
 
 public class RedisSinkTask extends SinkTask {
@@ -44,34 +46,38 @@ public class RedisSinkTask extends SinkTask {
     private String redisMaster;
 
     private void createRedisConnection() {
-        try {
-            jedisSentinelPool = new JedisSentinelPool(redisMaster, sentinels);
-            jedis = jedisSentinelPool.getResource();
-            jedisPipeline = jedis.pipelined();
+        // Let connection failures propagate. Callers decide how to react: startup
+        // tolerates them (put() retries lazily) and put() maps them to a
+        // RetriableException so Kafka Connect re-delivers the batch.
+        jedisSentinelPool = new JedisSentinelPool(redisMaster, sentinels);
+        jedis = jedisSentinelPool.getResource();
+        jedisPipeline = jedis.pipelined();
 
-            logger.info("Redis connection created");
-        } catch (Exception e) {
-            logger.error("Failed to create Redis connection", e);
-        }
+        logger.info("Redis connection created");
     }
 
     private void closeRedisConnection() {
-        if (jedisPipeline != null) {
-            jedisPipeline.close();
-        }
-        if (jedis != null) {
-            jedis.close();
-        }
-        if (jedisSentinelPool != null) {
-            jedisSentinelPool.close();
-        }
+        try {
+            if (jedisPipeline != null) {
+                jedisPipeline.close();
+            }
+            if (jedis != null) {
+                jedis.close();
+            }
+            if (jedisSentinelPool != null) {
+                jedisSentinelPool.close();
+            }
+        } catch (Exception e) {
+            logger.warn("Error while closing Redis connection", e);
+        } finally {
+            // Always clear references so a half-open/closed connection is never
+            // reused; the next put() rebuilds from a clean state.
+            jedisPipeline = null;
+            jedis = null;
+            jedisSentinelPool = null;
 
-        logger.info("Redis connection closed");
-    }
-
-    private void reconnectToRedis() {
-        closeRedisConnection();
-        createRedisConnection();
+            logger.info("Redis connection closed");
+        }
     }
 
     @Override
@@ -94,26 +100,47 @@ public class RedisSinkTask extends SinkTask {
             sentinels.add(redisHostPort);
         }
 
-        createRedisConnection();
+        try {
+            createRedisConnection();
+        } catch (JedisAccessControlException e) {
+            // Invalid credentials/ACLs are a permanent misconfiguration — fail fast
+            // at startup instead of reporting a healthy task that can never write.
+            logger.error("Redis access control error on startup", e);
+            closeRedisConnection();
+            throw new ConnectException("Redis access control error", e);
+        } catch (JedisException e) {
+            // A transient Redis outage at startup must not permanently fail the
+            // task. Clean up any partial state; put() will (re)connect and retry.
+            logger.warn("Could not connect to Redis on startup, will retry on first put", e);
+            closeRedisConnection();
+        }
     }
 
     @Override
     public void put(Collection<SinkRecord> records) {
-        if (records.size() > 0) {
-            logger.debug("Received records from Connect");
+        if (records.isEmpty()) {
+            return;
         }
 
-        String key = null;
-        String value = null;
+        logger.debug("Received {} records from Connect", records.size());
 
         List<JSONObject> jsonObjects = new ArrayList<JSONObject>();
         List<Response<Double>> newBilledCreditsResponses = new ArrayList<Response<Double>>();
+        List<HttpPost> mailRequests = new ArrayList<HttpPost>();
 
-        for (SinkRecord record : records) {
-            try {
+        // A pipeline only buffers commands locally; the connection is exercised by
+        // sync() below. The whole batch therefore shares one try/catch so any Redis
+        // failure (connection, pool, sentinel) maps to a single RetriableException.
+        try {
+            if (jedisPipeline == null) {
+                createRedisConnection();
+            }
+
+            for (SinkRecord record : records) {
                 logger.debug("Processing record: {}", record);
-                key = record.key() == null ? "" : record.key().toString();
-                value = record.value() == null ? "" : record.value().toString();
+
+                String key = record.key() == null ? "" : record.key().toString();
+                String value = record.value() == null ? "" : record.value().toString();
 
                 JSONObject json = new JSONObject(value);
                 jsonObjects.add(json);
@@ -126,38 +153,40 @@ public class RedisSinkTask extends SinkTask {
 
                 jedisPipeline.expireAt(key, expireAtValue);
 
-                logger.debug("Record written to Redis: key={}, value={}", key, value);
-
-            } catch (JedisConnectionException e) {
-                logger.error("Redis connection error", e);
-                reconnectToRedis();
-                throw new RetriableException("Redis connection error", e);
-            } catch (JedisAccessControlException e) {
-                logger.error("Redis access control error", e);
-                reconnectToRedis();
-                throw new RetriableException("Redis access control error", e);
-            } catch (Exception e) {
-                logger.error("Data or parsing error", e);
-                throw new DataException("Data or parsing error", e);
+                logger.debug("Record buffered for Redis: key={}, value={}", key, value);
             }
-        }
 
-        List<HttpPost> mailRequests = new ArrayList<HttpPost>();
-
-        try {
             jedisPipeline.sync();
 
             mailRequests = prepareMailRequests(jsonObjects, newBilledCreditsResponses);
-        } catch (JedisConnectionException e) {
-            logger.error("Redis connection error", e);
-            reconnectToRedis();
-            throw new RetriableException("Redis connection error", e);
         } catch (JedisAccessControlException e) {
+            // Auth/ACL errors are permanent — retrying cannot fix them, so fail the
+            // task loudly rather than hiding the misconfiguration behind retries.
+            // (Subclass of JedisDataException, so it must be caught before it.)
             logger.error("Redis access control error", e);
-            reconnectToRedis();
-            throw new RetriableException("Redis access control error", e);
+            closeRedisConnection();
+            throw new ConnectException("Redis access control error", e);
+        } catch (JedisDataException e) {
+            // Server rejected the command (e.g. WRONGTYPE, value not a valid float).
+            // Permanent for this batch — retrying would loop forever and hide the
+            // real data problem, so surface it as a non-retriable DataException.
+            logger.error("Redis command/data error", e);
+            closeRedisConnection();
+            throw new DataException("Redis command/data error", e);
+        } catch (JedisException e) {
+            // Everything else under JedisException is infrastructure: connection
+            // loss, pool exhaustion ("Could not get a resource from the pool") and
+            // sentinel failover — all transient. Drop the connection and retry.
+            logger.error("Redis connection error, will retry batch", e);
+            closeRedisConnection();
+            throw new RetriableException("Redis connection error", e);
         } catch (Exception e) {
+            // Malformed payloads etc. are not retriable; surface as a DataException.
+            // Drop the connection too: a mid-batch parse error can leave commands
+            // buffered (un-synced) on the pipeline, and resetting guarantees they
+            // can never be flushed by a later put() on a reused task instance.
             logger.error("Data or parsing error", e);
+            closeRedisConnection();
             throw new DataException("Data or parsing error", e);
         }
 
