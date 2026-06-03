@@ -167,7 +167,11 @@ public class RedisSinkTask extends SinkTask {
             throw new RetriableException("Redis connection error", e);
         } catch (Exception e) {
             // Malformed payloads etc. are not retriable; surface as a DataException.
+            // Drop the connection too: a mid-batch parse error can leave commands
+            // buffered (un-synced) on the pipeline, and resetting guarantees they
+            // can never be flushed by a later put() on a reused task instance.
             logger.error("Data or parsing error", e);
+            closeRedisConnection();
             throw new DataException("Data or parsing error", e);
         }
 
