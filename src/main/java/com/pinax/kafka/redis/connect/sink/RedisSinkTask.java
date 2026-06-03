@@ -27,6 +27,7 @@ import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisSentinelPool;
 import redis.clients.jedis.Pipeline;
 import redis.clients.jedis.exceptions.JedisAccessControlException;
+import redis.clients.jedis.exceptions.JedisDataException;
 import redis.clients.jedis.exceptions.JedisException;
 import redis.clients.jedis.Response;
 
@@ -101,6 +102,12 @@ public class RedisSinkTask extends SinkTask {
 
         try {
             createRedisConnection();
+        } catch (JedisAccessControlException e) {
+            // Invalid credentials/ACLs are a permanent misconfiguration — fail fast
+            // at startup instead of reporting a healthy task that can never write.
+            logger.error("Redis access control error on startup", e);
+            closeRedisConnection();
+            throw new ConnectException("Redis access control error", e);
         } catch (JedisException e) {
             // A transient Redis outage at startup must not permanently fail the
             // task. Clean up any partial state; put() will (re)connect and retry.
@@ -155,13 +162,21 @@ public class RedisSinkTask extends SinkTask {
         } catch (JedisAccessControlException e) {
             // Auth/ACL errors are permanent — retrying cannot fix them, so fail the
             // task loudly rather than hiding the misconfiguration behind retries.
+            // (Subclass of JedisDataException, so it must be caught before it.)
             logger.error("Redis access control error", e);
             closeRedisConnection();
             throw new ConnectException("Redis access control error", e);
+        } catch (JedisDataException e) {
+            // Server rejected the command (e.g. WRONGTYPE, value not a valid float).
+            // Permanent for this batch — retrying would loop forever and hide the
+            // real data problem, so surface it as a non-retriable DataException.
+            logger.error("Redis command/data error", e);
+            closeRedisConnection();
+            throw new DataException("Redis command/data error", e);
         } catch (JedisException e) {
-            // Base type covers JedisConnectionException plus the bare JedisException
-            // Jedis throws on pool exhaustion / sentinel failover — all transient.
-            // Drop the connection so the retry rebuilds it cleanly.
+            // Everything else under JedisException is infrastructure: connection
+            // loss, pool exhaustion ("Could not get a resource from the pool") and
+            // sentinel failover — all transient. Drop the connection and retry.
             logger.error("Redis connection error, will retry batch", e);
             closeRedisConnection();
             throw new RetriableException("Redis connection error", e);
