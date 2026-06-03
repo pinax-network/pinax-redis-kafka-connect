@@ -124,41 +124,49 @@ public class RedisSinkTask extends SinkTask {
 
         logger.debug("Received {} records from Connect", records.size());
 
-        List<JSONObject> jsonObjects = new ArrayList<JSONObject>();
-        List<Response<Double>> newBilledCreditsResponses = new ArrayList<Response<Double>>();
+        List<PendingWrite> pendingWrites = new ArrayList<PendingWrite>();
         List<HttpPost> mailRequests = new ArrayList<HttpPost>();
 
+        // Parse every record up front, before touching Redis, so a malformed payload
+        // fails the batch without ever leaving half-built state on the pipeline.
+        for (SinkRecord record : records) {
+            logger.debug("Processing record: {}", record);
+
+            String key = record.key() == null ? "" : record.key().toString();
+            String value = record.value() == null ? "" : record.value().toString();
+
+            try {
+                JSONObject json = new JSONObject(value);
+                double billedCredits = json.getDouble("billed_credits");
+                long expireAtValue = json.getLong("expiration");
+
+                pendingWrites.add(new PendingWrite(key, billedCredits, expireAtValue, json));
+            } catch (Exception e) {
+                logger.error("Data or parsing error for record: {}", record, e);
+                throw new DataException("Data or parsing error", e);
+            }
+        }
+
         // A pipeline only buffers commands locally; the connection is exercised by
-        // sync() below. The whole batch therefore shares one try/catch so any Redis
-        // failure (connection, pool, sentinel) maps to a single RetriableException.
+        // sync() below. The whole batch shares one try/catch so any Redis failure
+        // (connection, pool, sentinel) maps to a single RetriableException.
+        //
+        // Delivery is at-least-once: a retry re-applies the (non-idempotent)
+        // increment, so credits may be counted more than once. That is accepted in
+        // exchange for never missing a usage notification.
         try {
             if (jedisPipeline == null) {
                 createRedisConnection();
             }
 
-            for (SinkRecord record : records) {
-                logger.debug("Processing record: {}", record);
-
-                String key = record.key() == null ? "" : record.key().toString();
-                String value = record.value() == null ? "" : record.value().toString();
-
-                JSONObject json = new JSONObject(value);
-                jsonObjects.add(json);
-
-                double billedCredits = json.getDouble("billed_credits");
-                long expireAtValue = json.getLong("expiration");
-
-                Response<Double> newBilledCreditsResponse = jedisPipeline.incrByFloat(key, billedCredits);
-                newBilledCreditsResponses.add(newBilledCreditsResponse);
-
-                jedisPipeline.expireAt(key, expireAtValue);
-
-                logger.debug("Record buffered for Redis: key={}, value={}", key, value);
+            for (PendingWrite write : pendingWrites) {
+                write.response = jedisPipeline.incrByFloat(write.key, write.billedCredits);
+                jedisPipeline.expireAt(write.key, write.expireAt);
             }
 
             jedisPipeline.sync();
 
-            mailRequests = prepareMailRequests(jsonObjects, newBilledCreditsResponses);
+            mailRequests = prepareMailRequests(pendingWrites);
         } catch (JedisAccessControlException e) {
             // Auth/ACL errors are permanent — retrying cannot fix them, so fail the
             // task loudly rather than hiding the misconfiguration behind retries.
@@ -181,10 +189,9 @@ public class RedisSinkTask extends SinkTask {
             closeRedisConnection();
             throw new RetriableException("Redis connection error", e);
         } catch (Exception e) {
-            // Malformed payloads etc. are not retriable; surface as a DataException.
-            // Drop the connection too: a mid-batch parse error can leave commands
-            // buffered (un-synced) on the pipeline, and resetting guarantees they
-            // can never be flushed by a later put() on a reused task instance.
+            // Any other error here (e.g. a missing field while building mail
+            // requests) is not retriable. Drop the connection defensively so no
+            // buffered command can ever be flushed by a later put() on this task.
             logger.error("Data or parsing error", e);
             closeRedisConnection();
             throw new DataException("Data or parsing error", e);
@@ -215,74 +222,51 @@ public class RedisSinkTask extends SinkTask {
         }
     }
 
-    private List<HttpPost> prepareMailRequests(List<JSONObject> jsonObjects,
-            List<Response<Double>> newBilledCreditsResponses) {
+    private List<HttpPost> prepareMailRequests(List<PendingWrite> pendingWrites) {
         List<HttpPost> mailRequests = new ArrayList<HttpPost>();
 
-        // Prepare mail requests
-        for (int i = 0; i < jsonObjects.size(); i++) {
-            JSONObject json = jsonObjects.get(i);
-            Response<Double> newBilledCreditsResponse = newBilledCreditsResponses.get(i);
+        for (PendingWrite write : pendingWrites) {
+            double newBilledCredits = write.response.get();
+            double oldBilledCredits = newBilledCredits - write.billedCredits;
 
-            double billedCredits = json.getDouble("billed_credits");
-            String teamBillingEmail = json.getString("team_billing_email");
-            String teamName = json.getString("team_name");
-            String teamPlan = json.getString("team_plan");
+            JSONObject json = write.json;
             Integer includedCredits = json.getInt("included_credits");
             Integer creditCutoff = json.getInt("credit_cutoff");
 
-            double newBilledCredits = newBilledCreditsResponse.get();
-            double oldBilledCredits = newBilledCreditsResponse.get() - billedCredits;
+            // Only teams with an included-credit allowance distinct from the cutoff
+            // receive usage notifications.
+            if (includedCredits <= 0 || includedCredits.equals(creditCutoff)) {
+                continue;
+            }
 
-            // if (creditCutoff > 0) {
+            List<Double> creditThresholds = new ArrayList<Double>();
+            creditThresholds.add(includedCredits * 0.50);
+            creditThresholds.add(includedCredits * 0.75);
+            creditThresholds.add(includedCredits * 0.90);
+            creditThresholds.add(includedCredits * 1.00);
+            creditThresholds.add(includedCredits * 1.50);
+            creditThresholds.add(includedCredits * 2.00);
 
-            // List<Double> creditThresholds = new ArrayList<Double>();
-            // creditThresholds.add(creditCutoff * 0.50);
-            // creditThresholds.add(creditCutoff * 0.75);
-            // creditThresholds.add(creditCutoff * 0.90);
-            // creditThresholds.add(creditCutoff * 1.00);
+            // Format to currency and remove the currency symbol.
+            DecimalFormat formatter = (DecimalFormat) NumberFormat.getCurrencyInstance(Locale.US);
+            DecimalFormatSymbols symbols = formatter.getDecimalFormatSymbols();
+            symbols.setCurrencySymbol("");
+            formatter.setDecimalFormatSymbols(symbols);
 
-            // for (Double creditThreshold : creditThresholds) {
-            // if (oldBilledCredits < creditThreshold && newBilledCredits >=
-            // creditThreshold) {
-            // MailContent mailContent = new MailContent(teamName, teamPlan,
-            // newBilledCredits,
-            // includedCredits);
-            // mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
-            // "An Update on your Monthly Usage", mailContent)); // TODO: Change the mail
-            // subject
-            // break;
-            // }
-            // }
-            // }
+            for (Double creditThreshold : creditThresholds) {
+                if (oldBilledCredits < creditThreshold && newBilledCredits >= creditThreshold) {
+                    String newBilledCreditsString = formatter.format(newBilledCredits / 100);
+                    String includedCreditsString = formatter.format(includedCredits / 100);
 
-            if (includedCredits > 0 && includedCredits != creditCutoff) {
+                    String teamBillingEmail = json.getString("team_billing_email");
+                    String teamName = json.getString("team_name");
+                    String teamPlan = json.getString("team_plan");
 
-                List<Double> creditThresholds = new ArrayList<Double>();
-                creditThresholds.add(includedCredits * 0.50);
-                creditThresholds.add(includedCredits * 0.75);
-                creditThresholds.add(includedCredits * 0.90);
-                creditThresholds.add(includedCredits * 1.00);
-                creditThresholds.add(includedCredits * 1.50);
-                creditThresholds.add(includedCredits * 2.00);
-
-                // Format to currency and remove currency symbol
-                DecimalFormat formatter = (DecimalFormat) NumberFormat.getCurrencyInstance(Locale.US);
-                DecimalFormatSymbols symbols = formatter.getDecimalFormatSymbols();
-                symbols.setCurrencySymbol("");
-                formatter.setDecimalFormatSymbols(symbols);
-
-                for (Double creditThreshold : creditThresholds) {
-                    if (oldBilledCredits < creditThreshold && newBilledCredits >= creditThreshold) {
-                        String newBilledCreditsString = formatter.format(newBilledCredits / 100);
-                        String includedCreditsString = formatter.format(includedCredits / 100);
-
-                        MailContent mailContent = new MailContent(teamName, teamPlan, newBilledCreditsString,
-                                includedCreditsString);
-                        mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
-                                "An Update on your Monthly Usage", mailContent)); // TODO: Change the mail subject
-                        break;
-                    }
+                    MailContent mailContent = new MailContent(teamName, teamPlan, newBilledCreditsString,
+                            includedCreditsString);
+                    mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
+                            "An Update on your Monthly Usage", mailContent)); // TODO: Change the mail subject
+                    break;
                 }
             }
         }
@@ -302,5 +286,24 @@ public class RedisSinkTask extends SinkTask {
     @Override
     public String version() {
         return RedisSinkConnector.VERSION;
+    }
+
+    /**
+     * A parsed sink record awaiting its write. {@code response} holds the new
+     * billed-credits value once the pipeline is synced.
+     */
+    private static final class PendingWrite {
+        final String key;
+        final double billedCredits;
+        final long expireAt;
+        final JSONObject json;
+        Response<Double> response;
+
+        PendingWrite(String key, double billedCredits, long expireAt, JSONObject json) {
+            this.key = key;
+            this.billedCredits = billedCredits;
+            this.expireAt = expireAt;
+            this.json = json;
+        }
     }
 }
