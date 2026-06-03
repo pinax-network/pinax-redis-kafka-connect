@@ -142,7 +142,10 @@ public class RedisSinkTask extends SinkTask {
                 long expireAtValue = json.getLong("expiration");
 
                 pendingWrites.add(new PendingWrite(key, billedCredits, expireAtValue, json));
-            } catch (Exception e) {
+            } catch (JSONException e) {
+                // Only JSON/field-shape problems are "bad data" — surface as a
+                // non-retriable DataException. Anything unexpected propagates with
+                // its real type rather than being mislabelled a parsing error.
                 logger.error("Data or parsing error for record: {}", record, e);
                 throw new DataException("Data or parsing error", e);
             }
