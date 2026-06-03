@@ -126,7 +126,9 @@ public class RedisSinkTask extends SinkTask {
         logger.debug("Received {} records from Connect", records.size());
 
         List<PendingWrite> pendingWrites = new ArrayList<PendingWrite>();
-        List<HttpPost> mailRequests = new ArrayList<HttpPost>();
+        // Assigned in the try below (every catch rethrows, so it is always set
+        // before the mail-sending code reads it); no initializer needed.
+        List<HttpPost> mailRequests;
 
         // Parse every record up front, before touching Redis, so a malformed payload
         // fails the batch without ever leaving half-built state on the pipeline.
