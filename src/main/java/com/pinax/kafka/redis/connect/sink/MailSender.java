@@ -1,5 +1,6 @@
 package com.pinax.kafka.redis.connect.sink;
 
+import java.io.Closeable;
 import java.io.IOException;
 
 import org.apache.hc.client5.http.classic.methods.HttpPost;
@@ -13,7 +14,7 @@ import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class MailSender {
+public class MailSender implements Closeable {
     private final Logger logger = LoggerFactory.getLogger(RedisSinkConnector.class);
 
     private static final String MAILCHIMP_API_URL = "https://mandrillapp.com/api/1.0/messages/send-template";
@@ -22,10 +23,16 @@ public class MailSender {
     private final String mailChimpApiKey;
     private final String templateSlug;
 
+    // Shared, thread-safe client backed by a pooling connection manager. One per
+    // MailSender for its whole lifetime — sends run concurrently from put() and
+    // reuse pooled connections instead of leaking a client+sockets per email.
+    private final CloseableHttpClient httpClient;
+
     MailSender(String from, String mailChimpApiKey, String templateSlug) {
         this.from = from;
         this.mailChimpApiKey = mailChimpApiKey;
         this.templateSlug = templateSlug;
+        this.httpClient = HttpClientBuilder.create().build();
     }
 
     private JSONObject prepareBody(String to, String subject, MailContent mailContent) {
@@ -59,8 +66,6 @@ public class MailSender {
     }
 
     public void SendUsageMailRequest(HttpPost usageMailRequest) {
-        CloseableHttpClient httpClient = HttpClientBuilder.create().build();
-
         try {
             httpClient.execute(usageMailRequest, response -> {
                 int status = response.getCode();
@@ -75,7 +80,16 @@ public class MailSender {
                 }
             });
         } catch (IOException e) {
-            e.printStackTrace();
+            logger.error("Failed to send usage mail", e);
+        }
+    }
+
+    @Override
+    public void close() {
+        try {
+            httpClient.close();
+        } catch (IOException e) {
+            logger.warn("Error while closing mail HTTP client", e);
         }
     }
 }
