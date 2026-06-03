@@ -189,12 +189,14 @@ public class RedisSinkTask extends SinkTask {
             closeRedisConnection();
             throw new RetriableException("Redis connection error", e);
         } catch (Exception e) {
-            // Any other error here (e.g. a missing field while building mail
-            // requests) is not retriable. Drop the connection defensively so no
-            // buffered command can ever be flushed by a later put() on this task.
-            logger.error("Data or parsing error", e);
+            // Unexpected non-retriable failure while writing the batch to Redis.
+            // (Malformed payloads are caught during parsing above, and a bad
+            // notification field is skipped in prepareMailRequests, so this is a
+            // genuine catch-all.) Drop the connection defensively so no buffered
+            // command can ever be flushed by a later put() on this task.
+            logger.error("Non-retriable error while writing batch to Redis", e);
             closeRedisConnection();
-            throw new DataException("Data or parsing error", e);
+            throw new DataException("Non-retriable error while writing batch to Redis", e);
         }
 
         List<CompletableFuture<Void>> futures = new ArrayList<CompletableFuture<Void>>();
@@ -226,48 +228,55 @@ public class RedisSinkTask extends SinkTask {
         List<HttpPost> mailRequests = new ArrayList<HttpPost>();
 
         for (PendingWrite write : pendingWrites) {
-            double newBilledCredits = write.response.get();
-            double oldBilledCredits = newBilledCredits - write.billedCredits;
+            try {
+                double newBilledCredits = write.response.get();
+                double oldBilledCredits = newBilledCredits - write.billedCredits;
 
-            JSONObject json = write.json;
-            Integer includedCredits = json.getInt("included_credits");
-            Integer creditCutoff = json.getInt("credit_cutoff");
+                JSONObject json = write.json;
+                Integer includedCredits = json.getInt("included_credits");
+                Integer creditCutoff = json.getInt("credit_cutoff");
 
-            // Only teams with an included-credit allowance distinct from the cutoff
-            // receive usage notifications.
-            if (includedCredits <= 0 || includedCredits.equals(creditCutoff)) {
-                continue;
-            }
-
-            List<Double> creditThresholds = new ArrayList<Double>();
-            creditThresholds.add(includedCredits * 0.50);
-            creditThresholds.add(includedCredits * 0.75);
-            creditThresholds.add(includedCredits * 0.90);
-            creditThresholds.add(includedCredits * 1.00);
-            creditThresholds.add(includedCredits * 1.50);
-            creditThresholds.add(includedCredits * 2.00);
-
-            // Format to currency and remove the currency symbol.
-            DecimalFormat formatter = (DecimalFormat) NumberFormat.getCurrencyInstance(Locale.US);
-            DecimalFormatSymbols symbols = formatter.getDecimalFormatSymbols();
-            symbols.setCurrencySymbol("");
-            formatter.setDecimalFormatSymbols(symbols);
-
-            for (Double creditThreshold : creditThresholds) {
-                if (oldBilledCredits < creditThreshold && newBilledCredits >= creditThreshold) {
-                    String newBilledCreditsString = formatter.format(newBilledCredits / 100);
-                    String includedCreditsString = formatter.format(includedCredits / 100);
-
-                    String teamBillingEmail = json.getString("team_billing_email");
-                    String teamName = json.getString("team_name");
-                    String teamPlan = json.getString("team_plan");
-
-                    MailContent mailContent = new MailContent(teamName, teamPlan, newBilledCreditsString,
-                            includedCreditsString);
-                    mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
-                            "An Update on your Monthly Usage", mailContent)); // TODO: Change the mail subject
-                    break;
+                // Only teams with an included-credit allowance distinct from the cutoff
+                // receive usage notifications.
+                if (includedCredits <= 0 || includedCredits.equals(creditCutoff)) {
+                    continue;
                 }
+
+                List<Double> creditThresholds = new ArrayList<Double>();
+                creditThresholds.add(includedCredits * 0.50);
+                creditThresholds.add(includedCredits * 0.75);
+                creditThresholds.add(includedCredits * 0.90);
+                creditThresholds.add(includedCredits * 1.00);
+                creditThresholds.add(includedCredits * 1.50);
+                creditThresholds.add(includedCredits * 2.00);
+
+                // Format to currency and remove the currency symbol.
+                DecimalFormat formatter = (DecimalFormat) NumberFormat.getCurrencyInstance(Locale.US);
+                DecimalFormatSymbols symbols = formatter.getDecimalFormatSymbols();
+                symbols.setCurrencySymbol("");
+                formatter.setDecimalFormatSymbols(symbols);
+
+                for (Double creditThreshold : creditThresholds) {
+                    if (oldBilledCredits < creditThreshold && newBilledCredits >= creditThreshold) {
+                        String newBilledCreditsString = formatter.format(newBilledCredits / 100);
+                        String includedCreditsString = formatter.format(includedCredits / 100);
+
+                        String teamBillingEmail = json.getString("team_billing_email");
+                        String teamName = json.getString("team_name");
+                        String teamPlan = json.getString("team_plan");
+
+                        MailContent mailContent = new MailContent(teamName, teamPlan, newBilledCreditsString,
+                                includedCreditsString);
+                        mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
+                                "An Update on your Monthly Usage", mailContent)); // TODO: Change the mail subject
+                        break;
+                    }
+                }
+            } catch (Exception e) {
+                // A malformed or missing notification field must not fail the batch:
+                // the Redis writes were already committed by sync(). Skip this
+                // record's notification and carry on with the rest.
+                logger.error("Skipping usage notification for malformed record: key={}", write.key, e);
             }
         }
 
