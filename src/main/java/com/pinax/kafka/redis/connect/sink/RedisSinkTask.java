@@ -19,6 +19,7 @@ import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
+import org.json.JSONException;
 import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -124,41 +125,52 @@ public class RedisSinkTask extends SinkTask {
 
         logger.debug("Received {} records from Connect", records.size());
 
-        List<JSONObject> jsonObjects = new ArrayList<JSONObject>();
-        List<Response<Double>> newBilledCreditsResponses = new ArrayList<Response<Double>>();
+        List<PendingWrite> pendingWrites = new ArrayList<PendingWrite>();
         List<HttpPost> mailRequests = new ArrayList<HttpPost>();
 
+        // Parse every record up front, before touching Redis, so a malformed payload
+        // fails the batch without ever leaving half-built state on the pipeline.
+        for (SinkRecord record : records) {
+            logger.debug("Processing record: {}", record);
+
+            String key = record.key() == null ? "" : record.key().toString();
+            String value = record.value() == null ? "" : record.value().toString();
+
+            try {
+                JSONObject json = new JSONObject(value);
+                double billedCredits = json.getDouble("billed_credits");
+                long expireAtValue = json.getLong("expiration");
+
+                pendingWrites.add(new PendingWrite(key, billedCredits, expireAtValue, json));
+            } catch (JSONException e) {
+                // Only JSON/field-shape problems are "bad data" — surface as a
+                // non-retriable DataException. Anything unexpected propagates with
+                // its real type rather than being mislabelled a parsing error.
+                logger.error("Data or parsing error for record: {}", record, e);
+                throw new DataException("Data or parsing error", e);
+            }
+        }
+
         // A pipeline only buffers commands locally; the connection is exercised by
-        // sync() below. The whole batch therefore shares one try/catch so any Redis
-        // failure (connection, pool, sentinel) maps to a single RetriableException.
+        // sync() below. The whole batch shares one try/catch so any Redis failure
+        // (connection, pool, sentinel) maps to a single RetriableException.
+        //
+        // Delivery is at-least-once: a retry re-applies the (non-idempotent)
+        // increment, so credits may be counted more than once. That is accepted in
+        // exchange for never missing a usage notification.
         try {
             if (jedisPipeline == null) {
                 createRedisConnection();
             }
 
-            for (SinkRecord record : records) {
-                logger.debug("Processing record: {}", record);
-
-                String key = record.key() == null ? "" : record.key().toString();
-                String value = record.value() == null ? "" : record.value().toString();
-
-                JSONObject json = new JSONObject(value);
-                jsonObjects.add(json);
-
-                double billedCredits = json.getDouble("billed_credits");
-                long expireAtValue = json.getLong("expiration");
-
-                Response<Double> newBilledCreditsResponse = jedisPipeline.incrByFloat(key, billedCredits);
-                newBilledCreditsResponses.add(newBilledCreditsResponse);
-
-                jedisPipeline.expireAt(key, expireAtValue);
-
-                logger.debug("Record buffered for Redis: key={}, value={}", key, value);
+            for (PendingWrite write : pendingWrites) {
+                write.response = jedisPipeline.incrByFloat(write.key, write.billedCredits);
+                jedisPipeline.expireAt(write.key, write.expireAt);
             }
 
             jedisPipeline.sync();
 
-            mailRequests = prepareMailRequests(jsonObjects, newBilledCreditsResponses);
+            mailRequests = prepareMailRequests(pendingWrites);
         } catch (JedisAccessControlException e) {
             // Auth/ACL errors are permanent — retrying cannot fix them, so fail the
             // task loudly rather than hiding the misconfiguration behind retries.
@@ -181,13 +193,14 @@ public class RedisSinkTask extends SinkTask {
             closeRedisConnection();
             throw new RetriableException("Redis connection error", e);
         } catch (Exception e) {
-            // Malformed payloads etc. are not retriable; surface as a DataException.
-            // Drop the connection too: a mid-batch parse error can leave commands
-            // buffered (un-synced) on the pipeline, and resetting guarantees they
-            // can never be flushed by a later put() on a reused task instance.
-            logger.error("Data or parsing error", e);
+            // Unexpected non-retriable failure while writing the batch to Redis.
+            // (Malformed payloads are caught during parsing above, and a bad
+            // notification field is skipped in prepareMailRequests, so this is a
+            // genuine catch-all.) Drop the connection defensively so no buffered
+            // command can ever be flushed by a later put() on this task.
+            logger.error("Non-retriable error while writing batch to Redis", e);
             closeRedisConnection();
-            throw new DataException("Data or parsing error", e);
+            throw new DataException("Non-retriable error while writing batch to Redis", e);
         }
 
         List<CompletableFuture<Void>> futures = new ArrayList<CompletableFuture<Void>>();
@@ -215,48 +228,27 @@ public class RedisSinkTask extends SinkTask {
         }
     }
 
-    private List<HttpPost> prepareMailRequests(List<JSONObject> jsonObjects,
-            List<Response<Double>> newBilledCreditsResponses) {
+    private List<HttpPost> prepareMailRequests(List<PendingWrite> pendingWrites) {
         List<HttpPost> mailRequests = new ArrayList<HttpPost>();
 
-        // Prepare mail requests
-        for (int i = 0; i < jsonObjects.size(); i++) {
-            JSONObject json = jsonObjects.get(i);
-            Response<Double> newBilledCreditsResponse = newBilledCreditsResponses.get(i);
+        for (PendingWrite write : pendingWrites) {
+            // Read the pipelined result outside the try below: Jedis surfaces a
+            // per-command server error (e.g. WRONGTYPE, "value is not a valid float")
+            // here at get(), not at sync(). Letting it propagate routes it to put()'s
+            // JedisDataException handler instead of silently dropping a failed write.
+            double newBilledCredits = write.response.get();
+            double oldBilledCredits = newBilledCredits - write.billedCredits;
 
-            double billedCredits = json.getDouble("billed_credits");
-            String teamBillingEmail = json.getString("team_billing_email");
-            String teamName = json.getString("team_name");
-            String teamPlan = json.getString("team_plan");
-            Integer includedCredits = json.getInt("included_credits");
-            Integer creditCutoff = json.getInt("credit_cutoff");
+            try {
+                JSONObject json = write.json;
+                Integer includedCredits = json.getInt("included_credits");
+                Integer creditCutoff = json.getInt("credit_cutoff");
 
-            double newBilledCredits = newBilledCreditsResponse.get();
-            double oldBilledCredits = newBilledCreditsResponse.get() - billedCredits;
-
-            // if (creditCutoff > 0) {
-
-            // List<Double> creditThresholds = new ArrayList<Double>();
-            // creditThresholds.add(creditCutoff * 0.50);
-            // creditThresholds.add(creditCutoff * 0.75);
-            // creditThresholds.add(creditCutoff * 0.90);
-            // creditThresholds.add(creditCutoff * 1.00);
-
-            // for (Double creditThreshold : creditThresholds) {
-            // if (oldBilledCredits < creditThreshold && newBilledCredits >=
-            // creditThreshold) {
-            // MailContent mailContent = new MailContent(teamName, teamPlan,
-            // newBilledCredits,
-            // includedCredits);
-            // mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
-            // "An Update on your Monthly Usage", mailContent)); // TODO: Change the mail
-            // subject
-            // break;
-            // }
-            // }
-            // }
-
-            if (includedCredits > 0 && includedCredits != creditCutoff) {
+                // Only teams with an included-credit allowance distinct from the cutoff
+                // receive usage notifications.
+                if (includedCredits <= 0 || includedCredits.equals(creditCutoff)) {
+                    continue;
+                }
 
                 List<Double> creditThresholds = new ArrayList<Double>();
                 creditThresholds.add(includedCredits * 0.50);
@@ -266,7 +258,7 @@ public class RedisSinkTask extends SinkTask {
                 creditThresholds.add(includedCredits * 1.50);
                 creditThresholds.add(includedCredits * 2.00);
 
-                // Format to currency and remove currency symbol
+                // Format to currency and remove the currency symbol.
                 DecimalFormat formatter = (DecimalFormat) NumberFormat.getCurrencyInstance(Locale.US);
                 DecimalFormatSymbols symbols = formatter.getDecimalFormatSymbols();
                 symbols.setCurrencySymbol("");
@@ -277,6 +269,10 @@ public class RedisSinkTask extends SinkTask {
                         String newBilledCreditsString = formatter.format(newBilledCredits / 100);
                         String includedCreditsString = formatter.format(includedCredits / 100);
 
+                        String teamBillingEmail = json.getString("team_billing_email");
+                        String teamName = json.getString("team_name");
+                        String teamPlan = json.getString("team_plan");
+
                         MailContent mailContent = new MailContent(teamName, teamPlan, newBilledCreditsString,
                                 includedCreditsString);
                         mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
@@ -284,6 +280,11 @@ public class RedisSinkTask extends SinkTask {
                         break;
                     }
                 }
+            } catch (JSONException e) {
+                // Only a malformed/missing notification field is skippable — the Redis
+                // write already succeeded, so don't fail the batch over a bad email.
+                // Redis/infra errors are NOT caught here; they propagate to put().
+                logger.error("Skipping usage notification for malformed record: key={}", write.key, e);
             }
         }
 
@@ -302,5 +303,24 @@ public class RedisSinkTask extends SinkTask {
     @Override
     public String version() {
         return RedisSinkConnector.VERSION;
+    }
+
+    /**
+     * A parsed sink record awaiting its write. {@code response} holds the new
+     * billed-credits value once the pipeline is synced.
+     */
+    private static final class PendingWrite {
+        final String key;
+        final double billedCredits;
+        final long expireAt;
+        final JSONObject json;
+        Response<Double> response;
+
+        PendingWrite(String key, double billedCredits, long expireAt, JSONObject json) {
+            this.key = key;
+            this.billedCredits = billedCredits;
+            this.expireAt = expireAt;
+            this.json = json;
+        }
     }
 }
