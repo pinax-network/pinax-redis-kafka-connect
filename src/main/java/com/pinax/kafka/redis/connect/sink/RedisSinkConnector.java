@@ -1,6 +1,7 @@
 package com.pinax.kafka.redis.connect.sink;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -26,7 +27,9 @@ public class RedisSinkConnector extends SinkConnector {
     @Override
     public void start(Map<String, String> configMap) {
         logger.info("Starting connector {}", configMap);
-        configs = configMap;
+        // Defensive copy so the connector does not retain a reference to a map
+        // owned by the caller (and which the caller could later mutate).
+        configs = new HashMap<>(configMap);
     }
 
     @Override

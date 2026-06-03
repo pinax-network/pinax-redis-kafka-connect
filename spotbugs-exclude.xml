@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SpotBugs false-positive / accepted-pattern exclusions. Keep this list small and
+  justified; prefer fixing real findings over excluding them.
+-->
+<FindBugsFilter>
+  <!--
+    MailSender.CreateUsageMailRequest / SendUsageMailRequest use PascalCase. These
+    are pre-existing internal (single-package) method names; renaming is a separate
+    API-naming change out of scope here. Not a correctness bug, so suppress the
+    naming-convention check for this class only.
+  -->
+  <Match>
+    <Class name="com.pinax.kafka.redis.connect.sink.MailSender"/>
+    <Bug pattern="NM_METHOD_NAMING_CONVENTION"/>
+  </Match>
+</FindBugsFilter>

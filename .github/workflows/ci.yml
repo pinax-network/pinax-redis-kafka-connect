@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build:
+    name: Build, test & static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: maven
+
+      # `verify` compiles, runs unit tests (Surefire) and the Testcontainers
+      # integration tests (Failsafe), and builds the shaded plugin jar.
+      # ubuntu-latest ships a running Docker daemon, so the integration tests
+      # execute against a real Redis container here.
+      - name: Build & test
+        run: mvn -B --no-transfer-progress clean verify
+
+      - name: Checkstyle
+        run: mvn -B --no-transfer-progress checkstyle:check
+
+      - name: SpotBugs
+        run: mvn -B --no-transfer-progress spotbugs:check
+
+      - name: Upload build artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pinax-redis-kafka-connect
+          path: target/pinax-redis-kafka-connect.jar
+          if-no-files-found: error
