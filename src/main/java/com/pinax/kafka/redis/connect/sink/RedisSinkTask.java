@@ -19,6 +19,7 @@ import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
+import org.json.JSONException;
 import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -228,10 +229,14 @@ public class RedisSinkTask extends SinkTask {
         List<HttpPost> mailRequests = new ArrayList<HttpPost>();
 
         for (PendingWrite write : pendingWrites) {
-            try {
-                double newBilledCredits = write.response.get();
-                double oldBilledCredits = newBilledCredits - write.billedCredits;
+            // Read the pipelined result outside the try below: Jedis surfaces a
+            // per-command server error (e.g. WRONGTYPE, "value is not a valid float")
+            // here at get(), not at sync(). Letting it propagate routes it to put()'s
+            // JedisDataException handler instead of silently dropping a failed write.
+            double newBilledCredits = write.response.get();
+            double oldBilledCredits = newBilledCredits - write.billedCredits;
 
+            try {
                 JSONObject json = write.json;
                 Integer includedCredits = json.getInt("included_credits");
                 Integer creditCutoff = json.getInt("credit_cutoff");
@@ -272,10 +277,10 @@ public class RedisSinkTask extends SinkTask {
                         break;
                     }
                 }
-            } catch (Exception e) {
-                // A malformed or missing notification field must not fail the batch:
-                // the Redis writes were already committed by sync(). Skip this
-                // record's notification and carry on with the rest.
+            } catch (JSONException e) {
+                // Only a malformed/missing notification field is skippable — the Redis
+                // write already succeeded, so don't fail the batch over a bad email.
+                // Redis/infra errors are NOT caught here; they propagate to put().
                 logger.error("Skipping usage notification for malformed record: key={}", write.key, e);
             }
         }
