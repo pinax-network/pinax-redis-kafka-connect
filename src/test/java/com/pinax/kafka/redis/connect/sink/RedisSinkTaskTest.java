@@ -11,6 +11,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockConstruction;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -181,6 +182,42 @@ class RedisSinkTaskTest {
 
             verify(mailSender).CreateUsageMailRequest(eq("team@acme.test"), anyString(), any(MailContent.class));
             verify(mailSender).SendUsageMailRequest(any(HttpPost.class));
+        });
+    }
+
+    @Test
+    void put_includedCreditsEqualsCreditCutoff_stillSendsMail() {
+        // Regression guard: credit_cutoff no longer gates notifications, so a team
+        // whose included_credits equals credit_cutoff must still be emailed.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(6000.0); // crosses the 50% milestone of 10000
+
+            String json = "{\"billed_credits\":6000.0,\"expiration\":9999999999,"
+                    + "\"included_credits\":10000,\"credit_cutoff\":10000,"
+                    + "\"team_billing_email\":\"team@acme.test\",\"team_name\":\"Acme\","
+                    + "\"team_plan\":\"Pro\"}";
+            task.put(List.of(record("team:1", json)));
+
+            verify(mailSender).CreateUsageMailRequest(eq("team@acme.test"), anyString(), any(MailContent.class));
+            verify(mailSender).SendUsageMailRequest(any(HttpPost.class));
+        });
+    }
+
+    @Test
+    void put_batchCrossesMultipleMilestones_sendsExactlyOneMail() {
+        // 0 -> 16000 against an allowance of 10000 crosses 50/75/90/100/150% in one
+        // batch; only a single email (the highest milestone) must be sent.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(16000.0);
+
+            String json = "{\"billed_credits\":16000.0,\"expiration\":9999999999,"
+                    + "\"included_credits\":10000,\"credit_cutoff\":0,"
+                    + "\"team_billing_email\":\"team@acme.test\",\"team_name\":\"Acme\","
+                    + "\"team_plan\":\"Pro\"}";
+            task.put(List.of(record("team:1", json)));
+
+            verify(mailSender, times(1)).CreateUsageMailRequest(anyString(), anyString(), any(MailContent.class));
+            verify(mailSender, times(1)).SendUsageMailRequest(any(HttpPost.class));
         });
     }
 
