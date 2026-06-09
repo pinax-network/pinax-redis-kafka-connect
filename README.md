@@ -95,8 +95,8 @@ Plus the standard Kafka Connect sink properties (`topics`, `tasks.max`, converte
 |----------------------|---------|------------------------------------------------------------------------------------------------------------------------------|
 | `billed_credits`     | number  | Amount added to the key via `INCRBYFLOAT` (credits are stored as integer cents, i.e. a 100× multiplier).                     |
 | `expiration`         | number  | Unix epoch **seconds**; applied to the key via `EXPIREAT`.                                                                   |
-| `included_credits`   | integer | The team's included allowance (cents). Notifications are only evaluated when this is `> 0` and differs from `credit_cutoff`. |
-| `credit_cutoff`      | integer | Allowance/cutoff comparison value.                                                                                           |
+| `included_credits`   | integer | The team's included allowance (cents). Notifications are evaluated whenever this is `> 0`.                                   |
+| `credit_cutoff`      | integer | Ignored. Previously gated notifications; no longer read by the sink.                                                          |
 | `team_billing_email` | string  | Recipient of the usage email.                                                                                                |
 | `team_name`          | string  | Rendered into the email template.                                                                                            |
 | `team_plan`          | string  | Rendered into the email template.                                                                                            |
@@ -117,8 +117,9 @@ Example value:
 
 ### Notification milestones
 
-When `included_credits > 0` (and `!= credit_cutoff`), an email is sent the first time
-accumulated usage crosses each of these multiples of the allowance:
+When `included_credits > 0`, an email is sent when accumulated usage crosses one of these
+multiples of the allowance. If a single batch leaps past several at once, only the
+**highest** milestone crossed in that batch is notified:
 
 ```
 50%   75%   90%   100%   150%   200%
@@ -133,7 +134,7 @@ accumulated usage crosses each of these multiples of the allowance:
 - **Error classification** (`put()` maps Redis failures to the right Connect signal):
 
   | Failure | Mapped to | Effect |
-    |---|---|---|
+  |---|---|---|
   | Connection loss, pool exhaustion, sentinel failover (`JedisException`) | `RetriableException` | Connect retries the batch |
   | Auth / ACL error (`JedisAccessControlException`) | `ConnectException` | Task fails fast (permanent misconfig) |
   | Command/data error — `WRONGTYPE`, "not a valid float" (`JedisDataException`) | `DataException` | Non-retriable (retrying can't help) |

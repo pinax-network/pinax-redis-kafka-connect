@@ -243,12 +243,11 @@ public class RedisSinkTask extends SinkTask {
 
             try {
                 JSONObject json = write.json;
-                Integer includedCredits = json.getInt("included_credits");
-                Integer creditCutoff = json.getInt("credit_cutoff");
+                int includedCredits = json.getInt("included_credits");
 
-                // Only teams with an included-credit allowance distinct from the cutoff
-                // receive usage notifications.
-                if (includedCredits <= 0 || includedCredits.equals(creditCutoff)) {
+                // Any team with an included-credit allowance to measure against receives
+                // usage notifications.
+                if (includedCredits <= 0) {
                     continue;
                 }
 
@@ -266,7 +265,11 @@ public class RedisSinkTask extends SinkTask {
                 symbols.setCurrencySymbol("");
                 formatter.setDecimalFormatSymbols(symbols);
 
-                for (Double creditThreshold : creditThresholds) {
+                // A single batch can leap past several milestones at once; notify on the
+                // highest one crossed (the most significant), so walk high-to-low and stop
+                // at the first match.
+                for (int i = creditThresholds.size() - 1; i >= 0; i--) {
+                    double creditThreshold = creditThresholds.get(i);
                     if (oldBilledCredits < creditThreshold && newBilledCredits >= creditThreshold) {
                         String newBilledCreditsString = formatter.format(newBilledCredits / 100);
                         String includedCreditsString = formatter.format(includedCredits / 100);
