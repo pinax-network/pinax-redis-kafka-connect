@@ -134,7 +134,7 @@ multiples of the allowance. If a single batch leaps past several at once, only t
 - **Error classification** (`put()` maps Redis failures to the right Connect signal):
 
   | Failure | Mapped to | Effect |
-      |---|---|---|
+  |---|---|---|
   | Connection loss, pool exhaustion, sentinel failover (`JedisException`) | `RetriableException` | Connect retries the batch |
   | Auth / ACL error (`JedisAccessControlException`) | `ConnectException` | Task fails fast (permanent misconfig) |
   | Command/data error — `WRONGTYPE`, "not a valid float" (`JedisDataException`) | `DataException` | Non-retriable (retrying can't help) |

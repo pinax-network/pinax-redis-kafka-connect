@@ -115,10 +115,13 @@ public class MailSender implements Closeable {
      * of {@code sent}/{@code queued}/{@code scheduled} (accepted) or
      * {@code rejected}/{@code invalid} (not sent); an API-level error is a JSON object
      * with {@code "status":"error"}. Returns a human-readable description for every
-     * non-delivered recipient — empty when every recipient was accepted.
+     * non-delivered recipient — empty <em>only</em> when the body is an array and every
+     * recipient was accepted. Any non-array body (an error object or an otherwise
+     * unexpected shape) yields a failure entry, so an unexpected response is never
+     * mistaken for a success.
      *
-     * <p>Visible for testing. Throws {@link JSONException} if the body is not the
-     * expected shape, which the caller treats as a delivery failure.
+     * <p>Visible for testing. Throws {@link JSONException} if the body cannot be parsed
+     * as JSON at all, which the caller treats as a delivery failure.
      */
     static List<String> findMailFailures(String responseBody) {
         List<String> failures = new ArrayList<>();
@@ -135,10 +138,15 @@ public class MailSender implements Closeable {
                 }
             }
         } else if (parsed instanceof JSONObject) {
+            // A successful send-template response is always a JSON array, so any object
+            // here is either an explicit API error or an unexpected shape — never a
+            // delivery. Surface both rather than reporting a silent success.
             JSONObject result = (JSONObject) parsed;
             if ("error".equals(result.optString("status", ""))) {
                 failures.add("API error " + result.optString("name", "")
                         + ": " + result.optString("message", ""));
+            } else {
+                failures.add("Unexpected Mandrill response: " + result);
             }
         } else {
             throw new JSONException("Unexpected Mandrill response shape");

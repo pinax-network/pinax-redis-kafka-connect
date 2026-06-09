@@ -71,6 +71,16 @@ class MailSenderTest {
     }
 
     @Test
+    void unexpectedJsonObject_isReportedAsFailureNotSuccess() {
+        // A successful send-template response is always a JSON array. A bare object
+        // that is not an explicit error must NOT be treated as a silent success.
+        List<String> failures = MailSender.findMailFailures("{\"foo\":\"bar\"}");
+
+        assertEquals(1, failures.size());
+        assertTrue(failures.get(0).contains("Unexpected"));
+    }
+
+    @Test
     void malformedBody_throwsSoCallerTreatsItAsFailure() {
         assertThrows(JSONException.class, () -> MailSender.findMailFailures("not json"));
     }
