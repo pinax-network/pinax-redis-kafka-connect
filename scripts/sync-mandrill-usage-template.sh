@@ -45,7 +45,8 @@ case "${1:-}" in
 "")
   live=$(call templates/info "$(jq -n --arg n "$LIVE" '{name:$n}')")
   fail_on_error "$live"
-  if [[ "$(jq -r .publish_code <<<"$live")" == "$(cat "$dir/usage-notifications.html")" ]]; then
+  # Mandrill re-encodes quotes in attributes when it stores HTML ('Space Mono' becomes &#039;Space Mono&#039;), so compare decoded.
+  if jq -r .publish_code <<<"$live" | python3 -c 'import html, sys; a = html.unescape(sys.stdin.read()).strip(); b = html.unescape(open(sys.argv[1], encoding="utf-8").read()).strip(); sys.exit(a != b)' "$dir/usage-notifications.html"; then
     echo "$LIVE matches the repo (published $(jq -r .published_at <<<"$live") UTC)"
   else
     echo "$LIVE differs from the repo (published $(jq -r .published_at <<<"$live") UTC). --stage and --test, then --apply."
