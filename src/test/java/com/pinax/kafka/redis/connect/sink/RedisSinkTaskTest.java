@@ -220,15 +220,20 @@ class RedisSinkTaskTest {
 
             ArgumentCaptor<MailContent> content = ArgumentCaptor.forClass(MailContent.class);
             verify(mailSender, times(1)).CreateUsageMailRequest(anyString(),
-                    eq("You've used 150% of this month's credits"), content.capture());
+                    eq("You're past your included Pro usage (150%)"), content.capture());
             assertEquals("150", content.getValue().getUsagePercent());
             verify(mailSender, times(1)).SendUsageMailRequest(any(HttpPost.class));
         });
     }
 
     @Test
-    void usageMailSubject_namesTheMilestone() {
-        assertEquals("You've used 90% of this month's credits", RedisSinkTask.usageMailSubject(90));
+    void usageMailSubject_dependsOnPlanAndMilestone() {
+        assertEquals("You've used 90% of your free Pinax credits", RedisSinkTask.usageMailSubject("free", 90));
+        assertEquals("Your Pinax service is paused: free credits used up", RedisSinkTask.usageMailSubject("free", 100));
+        assertEquals("You've used 50% of your included Pro usage", RedisSinkTask.usageMailSubject("pro", 50));
+        assertEquals("You've used all of your included Pro usage", RedisSinkTask.usageMailSubject("pro", 100));
+        assertEquals("You're past your included Pro usage (150%)", RedisSinkTask.usageMailSubject("pro", 150));
+        assertEquals("You've used 75% of this month's included usage", RedisSinkTask.usageMailSubject("enterprise", 75));
     }
 
     @Test

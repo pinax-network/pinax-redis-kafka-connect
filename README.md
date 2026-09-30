@@ -125,7 +125,10 @@ multiples of the allowance. If a single batch leaps past several at once, only t
 50%   75%   90%   100%   150%   200%
 ```
 
-Each email has the subject `You've used <N>% of this month's credits` and these Mandrill
+The subject depends on the plan and milestone, e.g. `You've used 90% of your free Pinax credits`,
+`Your Pinax service is paused: free credits used up` or `You're past your included Pro usage (150%)`
+(see `RedisSinkTask.usageMailSubject`). It never includes the team name, which is usually the owner's
+name or email address. Each email has these Mandrill
 global merge vars (Mailchimp merge language, e.g. `*|TeamName|*`):
 
 | Merge var         | Example     | Notes                                                        |

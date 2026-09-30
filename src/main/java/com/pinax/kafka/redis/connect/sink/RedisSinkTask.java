@@ -284,7 +284,7 @@ public class RedisSinkTask extends SinkTask {
                         MailContent mailContent = new MailContent(teamName, teamPlan, newBilledCreditsString,
                                 includedCreditsString, String.valueOf(milestonePercent));
                         mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
-                                usageMailSubject(milestonePercent), mailContent));
+                                usageMailSubject(teamPlan, milestonePercent), mailContent));
                         break;
                     }
                 }
@@ -299,8 +299,22 @@ public class RedisSinkTask extends SinkTask {
         return mailRequests;
     }
 
-    static String usageMailSubject(int milestonePercent) {
-        return "You've used " + milestonePercent + "% of this month's credits";
+    // Team names are mostly auto-generated (the owner's name or email address), so subjects don't include them.
+    static String usageMailSubject(String teamPlan, int milestonePercent) {
+        if ("free".equalsIgnoreCase(teamPlan)) {
+            return milestonePercent >= 100
+                    ? "Your Pinax service is paused: free credits used up"
+                    : "You've used " + milestonePercent + "% of your free Pinax credits";
+        }
+        if ("pro".equalsIgnoreCase(teamPlan)) {
+            if (milestonePercent == 100) {
+                return "You've used all of your included Pro usage";
+            }
+            return milestonePercent > 100
+                    ? "You're past your included Pro usage (" + milestonePercent + "%)"
+                    : "You've used " + milestonePercent + "% of your included Pro usage";
+        }
+        return "You've used " + milestonePercent + "% of this month's included usage";
     }
 
     @Override
