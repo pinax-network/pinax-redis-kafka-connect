@@ -1,6 +1,7 @@
 package com.pinax.kafka.redis.connect.sink;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyDouble;
@@ -27,6 +28,7 @@ import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.mockito.MockedConstruction;
 
 import redis.clients.jedis.Jedis;
@@ -216,9 +218,17 @@ class RedisSinkTaskTest {
                     + "\"team_plan\":\"Pro\"}";
             task.put(List.of(record("team:1", json)));
 
-            verify(mailSender, times(1)).CreateUsageMailRequest(anyString(), anyString(), any(MailContent.class));
+            ArgumentCaptor<MailContent> content = ArgumentCaptor.forClass(MailContent.class);
+            verify(mailSender, times(1)).CreateUsageMailRequest(anyString(),
+                    eq("You've used 150% of this month's credits"), content.capture());
+            assertEquals("150", content.getValue().getUsagePercent());
             verify(mailSender, times(1)).SendUsageMailRequest(any(HttpPost.class));
         });
+    }
+
+    @Test
+    void usageMailSubject_namesTheMilestone() {
+        assertEquals("You've used 90% of this month's credits", RedisSinkTask.usageMailSubject(90));
     }
 
     @Test

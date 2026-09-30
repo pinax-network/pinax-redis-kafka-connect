@@ -258,6 +258,8 @@ public class RedisSinkTask extends SinkTask {
                 creditThresholds.add(includedCredits * 1.00);
                 creditThresholds.add(includedCredits * 1.50);
                 creditThresholds.add(includedCredits * 2.00);
+                // The same milestones as whole percentages, for the email.
+                List<Integer> milestonePercents = List.of(50, 75, 90, 100, 150, 200);
 
                 // Format to currency and remove the currency symbol.
                 DecimalFormat formatter = (DecimalFormat) NumberFormat.getCurrencyInstance(Locale.US);
@@ -278,10 +280,11 @@ public class RedisSinkTask extends SinkTask {
                         String teamName = json.getString("team_name");
                         String teamPlan = json.getString("team_plan");
 
+                        int milestonePercent = milestonePercents.get(i);
                         MailContent mailContent = new MailContent(teamName, teamPlan, newBilledCreditsString,
-                                includedCreditsString);
+                                includedCreditsString, String.valueOf(milestonePercent));
                         mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
-                                "An Update on your Monthly Usage", mailContent)); // TODO: Change the mail subject
+                                usageMailSubject(milestonePercent), mailContent));
                         break;
                     }
                 }
@@ -294,6 +297,10 @@ public class RedisSinkTask extends SinkTask {
         }
 
         return mailRequests;
+    }
+
+    static String usageMailSubject(int milestonePercent) {
+        return "You've used " + milestonePercent + "% of this month's credits";
     }
 
     @Override

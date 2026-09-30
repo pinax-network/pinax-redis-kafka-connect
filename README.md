@@ -125,6 +125,17 @@ multiples of the allowance. If a single batch leaps past several at once, only t
 50%   75%   90%   100%   150%   200%
 ```
 
+Each email has the subject `You've used <N>% of this month's credits` and these Mandrill
+global merge vars (Mailchimp merge language, e.g. `*|TeamName|*`):
+
+| Merge var         | Example     | Notes                                                        |
+|-------------------|-------------|--------------------------------------------------------------|
+| `TeamName`        | `Acme Labs` | `team_name`                                                  |
+| `TeamPlan`        | `pro`       | `team_plan`: `free`, `pro` or `enterprise`                   |
+| `BilledCredits`   | `180.40`    | usage so far this month, in USD, no currency symbol          |
+| `IncludedCredits` | `200.00`    | the plan's included credits, in USD, no currency symbol      |
+| `UsagePercent`    | `90`        | the milestone crossed: `50`, `75`, `90`, `100`, `150` or `200` |
+
 ## Behaviour & delivery semantics
 
 - **At-least-once.** On a retryable failure Connect re-delivers the batch. The
