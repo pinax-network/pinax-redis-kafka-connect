@@ -7,6 +7,7 @@ public class RedisSinkConfig {
         // Redis sink configuration
         public static final String MASTER = "master";
         public static final String HOSTS = "hosts";
+        public static final String OFFSETS_KEY = "offsetsKey";
 
         // Email sink configuration
         public static final String FROM = "from";
@@ -25,6 +26,13 @@ public class RedisSinkConfig {
                                         new RedisSinkConfigValidator(),
                                         ConfigDef.Importance.HIGH,
                                         "Redis hosts")
+                        .define(OFFSETS_KEY,
+                                        ConfigDef.Type.STRING,
+                                        "kafka-connect:redis-sink:offsets",
+                                        ConfigDef.Importance.MEDIUM,
+                                        "Prefix of the Redis hashes (one per topic, named <offsetsKey>:<topic>) "
+                                                        + "that hold the offset of the last record applied "
+                                                        + "per partition")
                         .define(FROM,
                                         ConfigDef.Type.STRING,
                                         "info@pinax.network", // TODO: change to correct email

@@ -5,6 +5,7 @@ import java.text.DecimalFormatSymbols;
 import java.text.NumberFormat;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -13,6 +14,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.HashSet;
 
 import org.apache.hc.client5.http.classic.methods.HttpPost;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.config.AbstractConfig;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.RetriableException;
@@ -26,7 +28,7 @@ import org.slf4j.LoggerFactory;
 
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisSentinelPool;
-import redis.clients.jedis.Pipeline;
+import redis.clients.jedis.Transaction;
 import redis.clients.jedis.exceptions.JedisAccessControlException;
 import redis.clients.jedis.exceptions.JedisDataException;
 import redis.clients.jedis.exceptions.JedisException;
@@ -39,12 +41,16 @@ public class RedisSinkTask extends SinkTask {
 
     private JedisSentinelPool jedisSentinelPool = null;
     private Jedis jedis = null;
-    private Pipeline jedisPipeline = null;
 
     private MailSender mailSender = null;
 
     private List<String> redisHosts;
     private String redisMaster;
+    private String offsetsKey;
+
+    // Partitions whose consumer position has been checked against the offset stored
+    // in Redis since they were assigned to this task, see rewindToStoredOffsets().
+    private final Set<TopicPartition> checkedPartitions = new HashSet<TopicPartition>();
 
     private void createRedisConnection() {
         // Let connection failures propagate. Callers decide how to react: startup
@@ -52,16 +58,12 @@ public class RedisSinkTask extends SinkTask {
         // RetriableException so Kafka Connect re-delivers the batch.
         jedisSentinelPool = new JedisSentinelPool(redisMaster, sentinels);
         jedis = jedisSentinelPool.getResource();
-        jedisPipeline = jedis.pipelined();
 
         logger.info("Redis connection created");
     }
 
     private void closeRedisConnection() {
         try {
-            if (jedisPipeline != null) {
-                jedisPipeline.close();
-            }
             if (jedis != null) {
                 jedis.close();
             }
@@ -72,8 +74,8 @@ public class RedisSinkTask extends SinkTask {
             logger.warn("Error while closing Redis connection", e);
         } finally {
             // Always clear references so a half-open/closed connection is never
-            // reused; the next put() rebuilds from a clean state.
-            jedisPipeline = null;
+            // reused; the next put() rebuilds from a clean state. Closing the
+            // connection also discards a pending WATCH or MULTI.
             jedis = null;
             jedisSentinelPool = null;
 
@@ -90,6 +92,8 @@ public class RedisSinkTask extends SinkTask {
         // Prepare Redis connection
         redisHosts = config.getList(RedisSinkConfig.HOSTS);
         redisMaster = config.getString(RedisSinkConfig.MASTER);
+        offsetsKey = config.getString(RedisSinkConfig.OFFSETS_KEY);
+        checkedPartitions.clear();
 
         // Prepare email sender
         mailSender = new MailSender(
@@ -118,6 +122,13 @@ public class RedisSinkTask extends SinkTask {
     }
 
     @Override
+    public void open(Collection<TopicPartition> partitions) {
+        // Newly assigned partitions start at the offsets Kafka has committed for the
+        // consumer group; the first put() compares them with the ones in Redis.
+        checkedPartitions.removeAll(partitions);
+    }
+
+    @Override
     public void put(Collection<SinkRecord> records) {
         if (records.isEmpty()) {
             return;
@@ -143,7 +154,9 @@ public class RedisSinkTask extends SinkTask {
                 double billedCredits = json.getDouble("billed_credits");
                 long expireAtValue = json.getLong("expiration");
 
-                pendingWrites.add(new PendingWrite(key, billedCredits, expireAtValue, json));
+                pendingWrites.add(new PendingWrite(
+                        new TopicPartition(record.topic(), record.kafkaPartition()), record.kafkaOffset(),
+                        key, billedCredits, expireAtValue, json));
             } catch (JSONException e) {
                 // Only JSON/field-shape problems are "bad data" — surface as a
                 // non-retriable DataException. Anything unexpected propagates with
@@ -153,26 +166,56 @@ public class RedisSinkTask extends SinkTask {
             }
         }
 
-        // A pipeline only buffers commands locally; the connection is exercised by
-        // sync() below. The whole batch shares one try/catch so any Redis failure
-        // (connection, pool, sentinel) maps to a single RetriableException.
+        // Each batch is one Redis transaction (MULTI/EXEC) that applies the increments
+        // and stores, per partition, the offset of the last record applied. Counters
+        // and offsets therefore always belong together, also in a snapshot or on a
+        // replica, and a record at or below the stored offset is known to be counted
+        // already: a batch Connect delivers again after a failure, a restart or a
+        // rewind of the consumer group is skipped instead of being counted twice.
         //
-        // Delivery is at-least-once: a retry re-applies the (non-idempotent)
-        // increment, so credits may be counted more than once. That is accepted in
-        // exchange for never missing a usage notification.
+        // The offset keys are WATCHed, so the transaction is refused when another task
+        // (one that lost its partitions but has not noticed yet) stored offsets in
+        // between; the batch is then retried against the new offsets.
+        //
+        // The whole batch shares one try/catch so any Redis failure (connection, pool,
+        // sentinel) maps to a single RetriableException.
         try {
-            if (jedisPipeline == null) {
+            if (jedis == null) {
                 createRedisConnection();
             }
 
-            for (PendingWrite write : pendingWrites) {
-                write.response = jedisPipeline.incrByFloat(write.key, write.billedCredits);
-                jedisPipeline.expireAt(write.key, write.expireAt);
+            Map<TopicPartition, Long> storedOffsets = watchStoredOffsets(pendingWrites);
+            pendingWrites = notYetApplied(pendingWrites, rewindToStoredOffsets(pendingWrites, storedOffsets),
+                    storedOffsets);
+
+            if (pendingWrites.isEmpty()) {
+                jedis.unwatch();
+                return;
             }
 
-            jedisPipeline.sync();
+            Map<TopicPartition, Long> appliedOffsets = new HashMap<TopicPartition, Long>();
+            Transaction transaction = jedis.multi();
+
+            for (PendingWrite write : pendingWrites) {
+                write.response = transaction.incrByFloat(write.key, write.billedCredits);
+                transaction.expireAt(write.key, write.expireAt);
+                appliedOffsets.merge(write.partition, write.offset, Math::max);
+            }
+            for (Map.Entry<TopicPartition, Long> applied : appliedOffsets.entrySet()) {
+                transaction.hset(offsetsKey(applied.getKey().topic()),
+                        Integer.toString(applied.getKey().partition()), Long.toString(applied.getValue()));
+            }
+
+            if (transaction.exec() == null) {
+                // Nothing was applied. Not an error of this batch, so retry it.
+                logger.warn("Offsets in Redis changed while writing the batch, will retry it");
+                throw new RetriableException("Offsets in Redis changed while writing the batch");
+            }
 
             mailRequests = prepareMailRequests(pendingWrites);
+        } catch (RetriableException e) {
+            // The refused transaction above; the connection is still good.
+            throw e;
         } catch (JedisAccessControlException e) {
             // Auth/ACL errors are permanent — retrying cannot fix them, so fail the
             // task loudly rather than hiding the misconfiguration behind retries.
@@ -184,6 +227,9 @@ public class RedisSinkTask extends SinkTask {
             // Server rejected the command (e.g. WRONGTYPE, value not a valid float).
             // Permanent for this batch — retrying would loop forever and hide the
             // real data problem, so surface it as a non-retriable DataException.
+            // Redis does not roll a transaction back: the other commands of the batch,
+            // its offsets included, are applied, so the batch is not counted again
+            // once the task is restarted.
             logger.error("Redis command/data error", e);
             closeRedisConnection();
             throw new DataException("Redis command/data error", e);
@@ -198,8 +244,8 @@ public class RedisSinkTask extends SinkTask {
             // Unexpected non-retriable failure while writing the batch to Redis.
             // (Malformed payloads are caught during parsing above, and a bad
             // notification field is skipped in prepareMailRequests, so this is a
-            // genuine catch-all.) Drop the connection defensively so no buffered
-            // command can ever be flushed by a later put() on this task.
+            // genuine catch-all.) Drop the connection defensively so no queued
+            // command can ever be executed by a later put() on this task.
             logger.error("Non-retriable error while writing batch to Redis", e);
             closeRedisConnection();
             throw new DataException("Non-retriable error while writing batch to Redis", e);
@@ -230,13 +276,104 @@ public class RedisSinkTask extends SinkTask {
         }
     }
 
+    private String offsetsKey(String topic) {
+        return offsetsKey + ":" + topic;
+    }
+
+    /**
+     * WATCHes the offset hash of every topic in the batch and returns the offsets
+     * stored in them: per partition, the offset of the last record applied to Redis.
+     */
+    private Map<TopicPartition, Long> watchStoredOffsets(List<PendingWrite> pendingWrites) {
+        Set<String> topics = new HashSet<String>();
+        for (PendingWrite write : pendingWrites) {
+            topics.add(write.partition.topic());
+        }
+
+        Map<TopicPartition, Long> storedOffsets = new HashMap<TopicPartition, Long>();
+        for (String topic : topics) {
+            jedis.watch(offsetsKey(topic));
+            for (Map.Entry<String, String> stored : jedis.hgetAll(offsetsKey(topic)).entrySet()) {
+                try {
+                    storedOffsets.put(new TopicPartition(topic, Integer.parseInt(stored.getKey())),
+                            Long.parseLong(stored.getValue()));
+                } catch (NumberFormatException e) {
+                    throw new DataException("Invalid offset in Redis hash " + offsetsKey(topic) + ": "
+                            + stored.getKey() + " = " + stored.getValue(), e);
+                }
+            }
+        }
+        return storedOffsets;
+    }
+
+    /**
+     * Makes Redis, not the consumer group, decide where a partition continues after
+     * it was assigned to this task. When the first batch of a partition starts
+     * beyond the record following the stored offset, the consumer is rewound to that
+     * record and the partition is left out of this batch; Connect delivers it again
+     * from there. That is what replays the missing records after Redis was restored
+     * from a snapshot: its counters and its offsets are both from the time of the
+     * snapshot.
+     *
+     * <p>Offsets are not contiguous (a transactional producer leaves a marker after
+     * every transaction), so a gap alone does not mean records are missing. The
+     * rewind is harmless then: the same records arrive again and are applied.
+     *
+     * @return the partitions that were rewound
+     */
+    private Set<TopicPartition> rewindToStoredOffsets(List<PendingWrite> pendingWrites,
+            Map<TopicPartition, Long> storedOffsets) {
+        Set<TopicPartition> rewound = new HashSet<TopicPartition>();
+
+        // Records arrive in offset order per partition, so the first one seen is the
+        // lowest of the batch.
+        for (PendingWrite write : pendingWrites) {
+            if (!checkedPartitions.add(write.partition)) {
+                continue;
+            }
+
+            Long storedOffset = storedOffsets.get(write.partition);
+            if (storedOffset != null && write.offset > storedOffset + 1) {
+                logger.info("Rewinding {} from offset {} to {}, the record after the last one applied to Redis",
+                        write.partition, write.offset, storedOffset + 1);
+                context.offset(write.partition, storedOffset + 1);
+                rewound.add(write.partition);
+            }
+        }
+        return rewound;
+    }
+
+    private List<PendingWrite> notYetApplied(List<PendingWrite> pendingWrites, Set<TopicPartition> rewound,
+            Map<TopicPartition, Long> storedOffsets) {
+        List<PendingWrite> remaining = new ArrayList<PendingWrite>();
+        int alreadyApplied = 0;
+
+        for (PendingWrite write : pendingWrites) {
+            if (rewound.contains(write.partition)) {
+                continue;
+            }
+
+            Long storedOffset = storedOffsets.get(write.partition);
+            if (storedOffset != null && write.offset <= storedOffset) {
+                alreadyApplied++;
+                continue;
+            }
+            remaining.add(write);
+        }
+
+        if (alreadyApplied > 0) {
+            logger.info("Skipping {} records that were already applied to Redis", alreadyApplied);
+        }
+        return remaining;
+    }
+
     private List<HttpPost> prepareMailRequests(List<PendingWrite> pendingWrites) {
         List<HttpPost> mailRequests = new ArrayList<HttpPost>();
 
         for (PendingWrite write : pendingWrites) {
-            // Read the pipelined result outside the try below: Jedis surfaces a
-            // per-command server error (e.g. WRONGTYPE, "value is not a valid float")
-            // here at get(), not at sync(). Letting it propagate routes it to put()'s
+            // Read the result outside the try below: Jedis surfaces a per-command
+            // server error (e.g. WRONGTYPE, "value is not a valid float") here at
+            // get(), not at exec(). Letting it propagate routes it to put()'s
             // JedisDataException handler instead of silently dropping a failed write.
             double newBilledCredits = write.response.get();
             double oldBilledCredits = newBilledCredits - write.billedCredits;
@@ -312,16 +449,21 @@ public class RedisSinkTask extends SinkTask {
 
     /**
      * A parsed sink record awaiting its write. {@code response} holds the new
-     * billed-credits value once the pipeline is synced.
+     * billed-credits value once the transaction is executed.
      */
     private static final class PendingWrite {
+        final TopicPartition partition;
+        final long offset;
         final String key;
         final double billedCredits;
         final long expireAt;
         final JSONObject json;
         Response<Double> response;
 
-        PendingWrite(String key, double billedCredits, long expireAt, JSONObject json) {
+        PendingWrite(TopicPartition partition, long offset, String key, double billedCredits, long expireAt,
+                JSONObject json) {
+            this.partition = partition;
+            this.offset = offset;
             this.key = key;
             this.billedCredits = billedCredits;
             this.expireAt = expireAt;
