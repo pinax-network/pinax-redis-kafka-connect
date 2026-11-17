@@ -3,6 +3,7 @@ package com.pinax.kafka.redis.connect.sink;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyDouble;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -265,15 +266,60 @@ class RedisSinkTaskTest {
     }
 
     @Test
-    void put_redisNotAcceptingWrites_failsTheTask() {
-        // Left to whatever restarts failed tasks, with its own backoff.
+    void put_redisLoading_isRetriedWithinMaxRetries() {
+        // Redis was restarted with a restored snapshot and is still loading it.
         withConnectedRedis(mailSender -> {
             when(jedis.hgetAll(anyString()))
                     .thenThrow(new JedisDataException("LOADING Redis is loading the dataset in memory"));
+            List<SinkRecord> batch = List.of(record("team:1", CREDITS_JSON));
 
-            assertThrows(DataException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON))));
-            verify(context, never()).timeout(anyLong());
+            for (int retry = 0; retry < 12; retry++) {
+                assertThrows(RetriableException.class, () -> task.put(batch));
+            }
+            verify(context, times(12)).timeout(5000L);
+            ConnectException givenUp = assertThrows(ConnectException.class, () -> task.put(batch));
+            assertFalse(givenUp instanceof RetriableException);
         });
+    }
+
+    @Test
+    void put_transactionDiscardedForATransientReason_throwsRetriable() {
+        // A command refused while it was queued: Jedis attaches the refusal to the
+        // EXECABORT error as a suppressed exception.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            JedisDataException aborted = new JedisDataException(
+                    "EXECABORT Transaction discarded because of previous errors.");
+            aborted.addSuppressed(new JedisDataException("OOM command not allowed when used memory > 'maxmemory'."));
+            when(transaction.exec()).thenThrow(aborted);
+
+            assertThrows(RetriableException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON))));
+        });
+    }
+
+    @Test
+    void isTransient_tellsPassingRefusalsFromPermanentOnes() {
+        assertTrue(RedisSinkTask.isTransient(new JedisDataException("READONLY You can't write against a read only replica.")));
+        assertTrue(RedisSinkTask.isTransient(new JedisDataException("MISCONF Redis is configured to save RDB snapshots")));
+        assertTrue(RedisSinkTask.isTransient(new JedisDataException(
+                "EXECABORT Transaction discarded because of: READONLY You can't write against a read only replica.")));
+
+        assertFalse(RedisSinkTask.isTransient(new JedisDataException("WRONGTYPE Operation against a key")));
+        assertFalse(RedisSinkTask.isTransient(new JedisDataException("ERR value is not a valid float")));
+        // No reason given: not known to pass.
+        assertFalse(RedisSinkTask.isTransient(new JedisDataException(
+                "EXECABORT Transaction discarded because of previous errors.")));
+
+        // MULTI was refused but EXEC was not: commands may have run in between.
+        JedisDataException noMulti = new JedisDataException("ERR EXEC without MULTI");
+        noMulti.addSuppressed(new JedisDataException("BUSY Redis is busy running a script"));
+        assertFalse(RedisSinkTask.isTransient(noMulti));
+
+        JedisDataException mixed = new JedisDataException(
+                "EXECABORT Transaction discarded because of previous errors.");
+        mixed.addSuppressed(new JedisDataException("OOM command not allowed"));
+        mixed.addSuppressed(new JedisDataException("ERR wrong number of arguments"));
+        assertFalse(RedisSinkTask.isTransient(mixed));
     }
 
     @Test

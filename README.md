@@ -62,7 +62,7 @@ and restart the worker.
 | `master`          | no       | `mymaster`           | Redis Sentinel master name.                                     |
 | `hosts`           | no       | `localhost:6379`     | Comma-separated list of Sentinel `host:port` addresses.         |
 | `offsetsKey`      | no       | `kafka-connect:redis-sink:offsets` | Prefix of the hashes holding the applied offsets, one per topic (`<offsetsKey>:<topic>`). |
-| `retryBackoffMs`  | no       | `5000`               | Milliseconds before a batch is retried after Redis was unreachable. |
+| `retryBackoffMs`  | no       | `5000`               | Milliseconds before a batch is retried after Redis was unreachable or not accepting writes. |
 | `conflictRetryBackoffMs` | no | `1000`              | Milliseconds before a batch is retried after its transaction was refused because the stored offsets changed. |
 | `maxRetries`      | no       | `12`                 | How often in a row a batch is retried before the task fails. About a minute with the default backoff. |
 | `from`            | no       | `info@pinax.network` | `From` address for notification emails (must be a valid email). |
@@ -194,7 +194,8 @@ multiples of the allowance. If a single batch leaps past several at once, only t
   not noticed yet: when it stored offsets in between, the transaction is refused,
   nothing is applied and the batch is retried after `conflictRetryBackoffMs`.
 - **Retries.** A batch that failed for a passing reason is delivered again by Connect
-  after `retryBackoffMs` (Redis unreachable) or
+  after `retryBackoffMs` (Redis unreachable, or not accepting writes: `LOADING`, `BUSY`,
+  `READONLY`, `MISCONF`, `OOM`) or
   `conflictRetryBackoffMs` (transaction refused). Connect would do so forever, with the
   task `RUNNING` while nothing is counted. After `maxRetries` retries in a row without a
   batch going through, the task fails instead, which shows in its status and leaves it
@@ -217,7 +218,9 @@ multiples of the allowance. If a single batch leaps past several at once, only t
 - **Moving a partition by hand.** Resetting the consumer group has no effect on a
   partition with a stored offset. To skip or repeat records, stop the connector, set the
   offset of the last record to treat as applied with
-  `HSET <offsetsKey>:<topic> <partition> <offset>`, and start it again.
+  `HSET <offsetsKey>:<topic> <partition> <offset>`, and start it again. Stop it, do not
+  pause it: a task that keeps running reads the stored offsets only for records it is
+  delivered, does not move its consumer, and overwrites the offset with its next batch.
 - **Error classification** (`put()` maps Redis failures to the right Connect signal):
 
   | Failure | Mapped to | Effect |
@@ -225,7 +228,7 @@ multiples of the allowance. If a single batch leaps past several at once, only t
   | Connection loss, pool exhaustion, sentinel failover (`JedisException`) | `RetriableException` | Connect retries the batch; the task fails after `maxRetries` in a row |
   | Offsets changed by another task between `WATCH` and `EXEC` | `RetriableException` | Connect retries the batch; the task fails after `maxRetries` in a row |
   | Auth / ACL error (`JedisAccessControlException`) | `ConnectException` | Task fails fast (permanent misconfig) |
-  | Redis reachable but refusing reads or writes — `LOADING`, `BUSY`, `READONLY`, `MISCONF`, `OOM`, also as the reason of an `EXECABORT` (`JedisDataException`) | `DataException` | Nothing was applied; the task fails and is left to whatever restarts failed tasks |
+  | Redis temporarily not accepting writes — `LOADING`, `BUSY`, `READONLY`, `MISCONF`, `OOM`, `NOREPLICAS`, also as the reason of an `EXECABORT` | `RetriableException` | Nothing was applied; Connect retries the batch on a new connection; the task fails after `maxRetries` in a row |
   | Kafka does not have the offset stored in Redis | `ConnectException` | Task fails before anything is written; the offset hash belongs to another topic or cluster |
   | Increment or expiration of one record rejected inside the transaction | `DataException` | Logged; the rest of the batch is applied and notified, then the task fails |
   | Offsets rejected inside the transaction, or another permanent error on the offset hash (`JedisDataException`) | `DataException` | Non-retriable (retrying can't help) |

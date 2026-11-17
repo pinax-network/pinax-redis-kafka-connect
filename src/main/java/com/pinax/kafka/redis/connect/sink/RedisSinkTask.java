@@ -65,6 +65,14 @@ public class RedisSinkTask extends SinkTask {
     // see checkSoughtOffsets().
     private final Map<TopicPartition, Long> soughtOffsets = new HashMap<TopicPartition, Long>();
 
+    // Errors Redis answers with while it cannot take writes for the moment: loading
+    // its dataset, blocked by a script, demoted to a replica, unable to persist, out
+    // of memory, or without enough replicas.
+    private static final String[] TRANSIENT_ERRORS = {
+        "LOADING", "BUSY", "READONLY", "MISCONF", "OOM", "MASTERDOWN", "NOREPLICAS", "TRYAGAIN", "CLUSTERDOWN" };
+    private static final String EXECABORT_CAUSE = "EXECABORT Transaction discarded because of: ";
+    private static final String EXEC_WITHOUT_MULTI = "EXEC without MULTI";
+
     private void createRedisConnection() {
         // Let connection failures propagate. Callers decide how to react: startup
         // tolerates them (put() retries lazily) and put() maps them to a
@@ -340,11 +348,19 @@ public class RedisSinkTask extends SinkTask {
             closeRedisConnection();
             throw new ConnectException("Redis access control error", e);
         } catch (JedisDataException e) {
-            // Server refused a read or the whole transaction: the offset hash holds
-            // another type, or Redis does not take writes right now (LOADING,
-            // READONLY, MISCONF, OOM). Nothing was applied. Not retried here: the
-            // task fails, and whatever restarts failed tasks retries with its own
-            // backoff and gives up visibly when Redis stays that way.
+            if (isTransient(e)) {
+                // Redis refused the read or the whole transaction because it does
+                // not take writes right now (still loading a restored snapshot,
+                // demoted in a failover). Nothing was applied, so retry the batch,
+                // within maxRetries. On a new connection: after a failover the
+                // sentinels name another master.
+                logger.warn("Redis is temporarily not accepting writes, will retry batch", e);
+                closeRedisConnection();
+                throw retry("Redis is temporarily not accepting writes", e, retryBackoffMs);
+            }
+            // Server refused a read or the whole transaction for a reason retrying
+            // cannot fix (e.g. the offset hash holds another type). Nothing was
+            // applied.
             logger.error("Redis command/data error", e);
             closeRedisConnection();
             throw new DataException("Redis command/data error", e);
@@ -365,6 +381,48 @@ public class RedisSinkTask extends SinkTask {
             closeRedisConnection();
             throw new DataException("Non-retriable error while writing batch to Redis", e);
         }
+    }
+
+    /**
+     * Whether Redis refused a command, or a transaction as a whole, for a reason that
+     * passes. A discarded transaction (EXECABORT) names the reason in its message or,
+     * when a command was refused while it was queued, carries the refusals as
+     * suppressed exceptions; it is transient when all of them are.
+     */
+    static boolean isTransient(JedisDataException e) {
+        String message = e.getMessage() == null ? "" : e.getMessage();
+        if (message.contains(EXEC_WITHOUT_MULTI)) {
+            // Redis refused MULTI but not EXEC, so it may have run commands in
+            // between on their own, outside a transaction. Whether and which is
+            // unknown: retrying could count them twice.
+            return false;
+        }
+        if (message.startsWith(EXECABORT_CAUSE)) {
+            message = message.substring(EXECABORT_CAUSE.length());
+        }
+        if (isTransientError(message)) {
+            return true;
+        }
+
+        Throwable[] refusals = e.getSuppressed();
+        for (Throwable refusal : refusals) {
+            if (!(refusal instanceof JedisDataException) || !isTransientError(refusal.getMessage())) {
+                return false;
+            }
+        }
+        return refusals.length > 0;
+    }
+
+    private static boolean isTransientError(String message) {
+        if (message == null) {
+            return false;
+        }
+        for (String error : TRANSIENT_ERRORS) {
+            if (message.equals(error) || message.startsWith(error + " ")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
