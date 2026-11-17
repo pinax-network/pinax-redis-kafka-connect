@@ -207,7 +207,13 @@ multiples of the allowance. If a single batch leaps past several at once, only t
   dead letter queue (`errors.tolerance=all`, `errors.deadletterqueue.topic.name`), the
   record is sent there before the offset moves, so a batch that is retried sends it
   again. A record the queue does not take (also with `errors.tolerance=none`, where
-  Connect refuses it) is logged and skipped all the same.
+  Connect refuses it) is logged and skipped all the same. The task waits at most 10
+  seconds per batch for the queue.
+  - On Connect workers 3.6 and 3.7 (3.8 not checked), `errors.tolerance=none` together
+    with a dead letter queue or `errors.log.enable=true` still fails the task on an
+    invalid record: the worker does so itself after the batch is committed. The record
+    is skipped once the task is restarted. Use `errors.tolerance=all` there, or a
+    worker from 3.9 on.
 - **Metrics.** `rejected-commands-total` and `invalid-records-total` count the two
   cases above. They are Connect plugin metrics (JMX:
   `kafka.connect:type=plugins,connector=…,task=…`) and need a Kafka Connect 4.1+ worker;

@@ -14,6 +14,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.HashSet;
 
 import org.apache.hc.client5.http.classic.methods.HttpPost;
@@ -72,6 +73,11 @@ public class RedisSinkTask extends SinkTask {
     private static final String[] TRANSIENT_ERRORS = {
         "LOADING", "BUSY", "READONLY", "MISCONF", "OOM", "MASTERDOWN", "NOREPLICAS", "TRYAGAIN", "CLUSTERDOWN" };
     private static final String EXECABORT_CAUSE = "EXECABORT Transaction discarded because of: ";
+    private static final String EXEC_WITHOUT_MULTI = "EXEC without MULTI";
+
+    // Sensors are registered by name for the whole worker; this keeps the ones of
+    // two tasks (two connectors, or a task and its replacement) apart.
+    private static final AtomicInteger SENSOR_IDS = new AtomicInteger();
 
     // How long to wait for a skipped record to reach the dead letter queue.
     private static final long DEAD_LETTER_TIMEOUT_MS = 10000L;
@@ -176,10 +182,11 @@ public class RedisSinkTask extends SinkTask {
             if (metrics == null) {
                 return;
             }
-            rejectedCommands = counter(metrics, "rejected-commands", REJECTED_COMMANDS_METRIC,
+            int id = SENSOR_IDS.incrementAndGet();
+            rejectedCommands = counter(metrics, "rejected-commands-" + id, REJECTED_COMMANDS_METRIC,
                     "Commands of committed batches that Redis rejected (wrong key type, value not a number, "
                             + "invalid expiration). The record's increment or expiration was not applied.");
-            invalidRecords = counter(metrics, "invalid-records", INVALID_RECORDS_METRIC,
+            invalidRecords = counter(metrics, "invalid-records-" + id, INVALID_RECORDS_METRIC,
                     "Records skipped because their value could not be parsed. Nothing was counted for them.");
         } catch (NoSuchMethodError | NoClassDefFoundError e) {
             // Plugin metrics came with Kafka Connect 4.1.
@@ -308,11 +315,7 @@ public class RedisSinkTask extends SinkTask {
             // Before the transaction moves the stored offset past them: once it has,
             // they are never delivered again. A batch that is retried sends them a
             // second time.
-            for (PendingWrite write : pendingWrites) {
-                if (write.isInvalid()) {
-                    sendToDeadLetterQueue(write);
-                }
-            }
+            sendToDeadLetterQueue(pendingWrites);
 
             Map<TopicPartition, Long> appliedOffsets = new HashMap<TopicPartition, Long>();
             List<Response<Long>> offsetResponses = new ArrayList<Response<Long>>();
@@ -437,28 +440,54 @@ public class RedisSinkTask extends SinkTask {
     }
 
     /**
-     * Hands a record that cannot be parsed to Connect's dead letter queue, if the
-     * connector has one, and waits for it to be written. Never fails the batch: the
+     * Hands the records of the batch that cannot be parsed to Connect's dead letter
+     * queue, if the connector has one, and waits for them to be written: all of them
+     * together, for no longer than DEAD_LETTER_TIMEOUT_MS. Never fails the batch: the
      * reporter throws when errors.tolerance is none, and a record that cannot reach
      * the queue must not hold up the partition any more than one that cannot be
      * parsed.
      */
-    private void sendToDeadLetterQueue(PendingWrite write) {
+    private void sendToDeadLetterQueue(List<PendingWrite> pendingWrites) {
         if (errantRecordReporter == null) {
             return;
         }
-        try {
-            Future<Void> sent = errantRecordReporter.report(write.record, write.parseError);
-            if (sent != null) {
-                sent.get(DEAD_LETTER_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+
+        int notSent = 0;
+        Exception firstFailure = null;
+        List<Future<Void>> sending = new ArrayList<Future<Void>>();
+        for (PendingWrite write : pendingWrites) {
+            if (!write.isInvalid()) {
+                continue;
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            logger.error("Interrupted while sending record {} offset {} to the dead letter queue",
-                    write.partition, write.offset, e);
-        } catch (Exception e) {
-            logger.error("Could not send record {} offset {} to the dead letter queue, skipping it anyway",
-                    write.partition, write.offset, e);
+            try {
+                Future<Void> sent = errantRecordReporter.report(write.record, write.parseError);
+                if (sent != null) {
+                    sending.add(sent);
+                }
+            } catch (RuntimeException e) {
+                notSent++;
+                firstFailure = firstFailure == null ? e : firstFailure;
+            }
+        }
+
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(DEAD_LETTER_TIMEOUT_MS);
+        for (Future<Void> sent : sending) {
+            try {
+                sent.get(Math.max(0L, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                notSent++;
+                firstFailure = firstFailure == null ? e : firstFailure;
+                break;
+            } catch (Exception e) {
+                notSent++;
+                firstFailure = firstFailure == null ? e : firstFailure;
+            }
+        }
+
+        if (notSent > 0) {
+            logger.error("Could not send {} records to the dead letter queue, skipping them anyway", notSent,
+                    firstFailure);
         }
     }
 
@@ -478,6 +507,12 @@ public class RedisSinkTask extends SinkTask {
      */
     static boolean isTransient(JedisDataException e) {
         String message = e.getMessage() == null ? "" : e.getMessage();
+        if (message.contains(EXEC_WITHOUT_MULTI)) {
+            // Redis refused MULTI but not EXEC, so it may have run commands in
+            // between on their own, outside a transaction. Whether and which is
+            // unknown: retrying could count them twice.
+            return false;
+        }
         if (message.startsWith(EXECABORT_CAUSE)) {
             message = message.substring(EXECABORT_CAUSE.length());
         }
@@ -615,11 +650,16 @@ public class RedisSinkTask extends SinkTask {
             Long storedOffset = storedOffsets.get(partition);
             if (storedOffset != null) {
                 Long first = firstInHand.get(partition);
-                if (first != null && first <= storedOffset + 1 && lastInHand.get(partition) > storedOffset) {
+                if (first != null && first <= storedOffset + 1 && lastInHand.get(partition) > storedOffset
+                        && !seekingPartitions.contains(partition)) {
                     // The batch in hand starts at or before the record after the
                     // stored offset and reaches beyond it, so it holds the records to
                     // continue with. Nothing to move or read again; what it holds at
                     // or below the stored offset is skipped as already applied.
+                    //
+                    // Not for a partition an earlier attempt at this batch requested
+                    // a seek for: Connect carries that seek out, so the consumer may
+                    // be elsewhere by now and has to be moved again.
                     logger.debug("{} continues in the batch in hand, after stored offset {}", partition,
                             storedOffset);
                     continue;

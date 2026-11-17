@@ -9,6 +9,7 @@ import static org.mockito.ArgumentMatchers.anyDouble;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.startsWith;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockConstruction;
 import static org.mockito.Mockito.never;
@@ -79,8 +80,8 @@ class RedisSinkTaskTest {
         rejectedCommands = mock(Sensor.class);
         when(context.pluginMetrics()).thenReturn(metrics);
         invalidRecords = mock(Sensor.class);
-        when(metrics.addSensor("rejected-commands")).thenReturn(rejectedCommands);
-        when(metrics.addSensor("invalid-records")).thenReturn(invalidRecords);
+        when(metrics.addSensor(startsWith("rejected-commands-"))).thenReturn(rejectedCommands);
+        when(metrics.addSensor(startsWith("invalid-records-"))).thenReturn(invalidRecords);
         task = new RedisSinkTask();
         task.initialize(context);
     }
@@ -280,6 +281,11 @@ class RedisSinkTaskTest {
                 "EXECABORT Transaction discarded because of: READONLY You can't write against a read only replica.")));
 
         assertFalse(RedisSinkTask.isTransient(new JedisDataException("WRONGTYPE Operation against a key")));
+
+        // MULTI was refused but EXEC was not: commands may have run in between.
+        JedisDataException noMulti = new JedisDataException("ERR EXEC without MULTI");
+        noMulti.addSuppressed(new JedisDataException("BUSY Redis is busy running a script"));
+        assertFalse(RedisSinkTask.isTransient(noMulti));
         assertFalse(RedisSinkTask.isTransient(new JedisDataException("ERR value is not a valid float")));
         // No reason given: not known to pass.
         assertFalse(RedisSinkTask.isTransient(new JedisDataException(
@@ -541,6 +547,31 @@ class RedisSinkTaskTest {
 
             verify(context).offset(PARTITION, 6L);
             verify(jedis, never()).multi();
+        });
+    }
+
+    @Test
+    void reconnect_afterASeekWasRequested_movesThePartitionAgain() {
+        // The first attempt asks for a seek to 26 and then fails. Connect carries the
+        // seek out anyway. The retry finds a Redis that holds 15: the batch in hand
+        // would continue there, but the consumer is at 26 by now.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            when(context.assignment()).thenReturn(Set.of(PARTITION));
+            storedOffset(25L);
+            when(jedis.unwatch()).thenThrow(new JedisConnectionException("connection reset")).thenReturn("OK");
+
+            List<SinkRecord> batch = List.of(record("team:1", CREDITS_JSON, 10L),
+                    record("team:1", CREDITS_JSON, 20L));
+            task.open(List.of(PARTITION));
+            assertThrows(RetriableException.class, () -> task.put(batch));
+            verify(context).offset(PARTITION, 26L);
+
+            storedOffset(15L);
+            task.put(batch);
+
+            verify(context).offset(PARTITION, 16L);
+            verify(transaction, never()).incrByFloat(anyString(), anyDouble());
         });
     }
 
