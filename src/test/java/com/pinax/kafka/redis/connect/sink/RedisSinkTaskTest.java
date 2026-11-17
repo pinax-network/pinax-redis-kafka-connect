@@ -1,7 +1,9 @@
 package com.pinax.kafka.redis.connect.sink;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyDouble;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -21,6 +23,8 @@ import java.util.Map;
 
 import org.apache.hc.client5.http.classic.methods.HttpPost;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.metrics.PluginMetrics;
+import org.apache.kafka.common.metrics.Sensor;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.errors.RetriableException;
@@ -54,16 +58,24 @@ class RedisSinkTaskTest {
     private Jedis jedis;
     private Transaction transaction;
     private SinkTaskContext context;
+    private Sensor rejectedCommands;
     private RedisSinkTask task;
 
     @BeforeEach
+    @SuppressWarnings("unchecked")
     void setUp() {
         jedis = mock(Jedis.class);
         transaction = mock(Transaction.class);
         when(jedis.multi()).thenReturn(transaction);
         when(jedis.hgetAll(anyString())).thenReturn(new HashMap<>());
         when(transaction.exec()).thenReturn(List.of());
+        when(transaction.expireAt(anyString(), anyLong())).thenReturn(mock(Response.class));
+        when(transaction.hset(anyString(), anyString(), anyString())).thenReturn(mock(Response.class));
         context = mock(SinkTaskContext.class);
+        PluginMetrics metrics = mock(PluginMetrics.class);
+        rejectedCommands = mock(Sensor.class);
+        when(context.pluginMetrics()).thenReturn(metrics);
+        when(metrics.addSensor(anyString())).thenReturn(rejectedCommands);
         task = new RedisSinkTask();
         task.initialize(context);
     }
@@ -98,7 +110,6 @@ class RedisSinkTaskTest {
         Response<Double> response = mock(Response.class);
         when(response.get()).thenReturn(newValue);
         when(transaction.incrByFloat(anyString(), anyDouble())).thenReturn(response);
-        when(transaction.expireAt(anyString(), anyLong())).thenReturn(mock(Response.class));
         return response;
     }
 
@@ -173,20 +184,86 @@ class RedisSinkTaskTest {
     }
 
     @Test
-    void put_perCommandErrorSurfacedAtGet_throwsDataException() {
-        // Jedis raises per-command errors (WRONGTYPE, bad float) at Response.get(),
-        // not at exec(). prepareMailRequests reads get() outside its catch so the
-        // error reaches put()'s JedisDataException handler -> DataException.
+    void put_redisLoading_throwsRetriable() {
+        withConnectedRedis(mailSender -> {
+            when(jedis.hgetAll(anyString()))
+                    .thenThrow(new JedisDataException("LOADING Redis is loading the dataset in memory"));
+
+            assertThrows(RetriableException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON))));
+        });
+    }
+
+    @Test
+    void put_transactionDiscardedForATransientReason_throwsRetriable() {
+        // A command refused while it was queued: Jedis attaches the refusal to the
+        // EXECABORT error as a suppressed exception.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            JedisDataException aborted = new JedisDataException(
+                    "EXECABORT Transaction discarded because of previous errors.");
+            aborted.addSuppressed(new JedisDataException("OOM command not allowed when used memory > 'maxmemory'."));
+            when(transaction.exec()).thenThrow(aborted);
+
+            assertThrows(RetriableException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON))));
+        });
+    }
+
+    @Test
+    void isTransient_tellsPassingRefusalsFromPermanentOnes() {
+        assertTrue(RedisSinkTask.isTransient(new JedisDataException("READONLY You can't write against a read only replica.")));
+        assertTrue(RedisSinkTask.isTransient(new JedisDataException("MISCONF Redis is configured to save RDB snapshots")));
+        assertTrue(RedisSinkTask.isTransient(new JedisDataException(
+                "EXECABORT Transaction discarded because of: READONLY You can't write against a read only replica.")));
+
+        assertFalse(RedisSinkTask.isTransient(new JedisDataException("WRONGTYPE Operation against a key")));
+        assertFalse(RedisSinkTask.isTransient(new JedisDataException("ERR value is not a valid float")));
+        // No reason given: not known to pass.
+        assertFalse(RedisSinkTask.isTransient(new JedisDataException(
+                "EXECABORT Transaction discarded because of previous errors.")));
+
+        JedisDataException mixed = new JedisDataException(
+                "EXECABORT Transaction discarded because of previous errors.");
+        mixed.addSuppressed(new JedisDataException("OOM command not allowed"));
+        mixed.addSuppressed(new JedisDataException("ERR wrong number of arguments"));
+        assertFalse(RedisSinkTask.isTransient(mixed));
+    }
+
+    @Test
+    void put_rejectedIncrement_isCountedAndTheRestOfTheBatchIsNotified() {
+        // Redis does not roll the transaction back: the rejected command's Response
+        // throws at get(), the other record is applied and gets its notification.
         withConnectedRedis(mailSender -> {
             @SuppressWarnings("unchecked")
-            Response<Double> response = mock(Response.class);
-            when(response.get()).thenThrow(new JedisDataException("WRONGTYPE"));
-            when(transaction.incrByFloat(anyString(), anyDouble())).thenReturn(response);
-            when(transaction.expireAt(anyString(), anyLong())).thenReturn(mock(Response.class));
+            Response<Double> rejected = mock(Response.class);
+            when(rejected.get()).thenThrow(new JedisDataException("WRONGTYPE"));
+            @SuppressWarnings("unchecked")
+            Response<Double> applied = mock(Response.class);
+            when(applied.get()).thenReturn(55.0);
+            when(transaction.incrByFloat(eq("team:1"), anyDouble())).thenReturn(rejected);
+            when(transaction.incrByFloat(eq("team:2"), anyDouble())).thenReturn(applied);
 
-            List<SinkRecord> records = List.of(
-                    record("team:1", "{\"billed_credits\":1.0,\"expiration\":9999999999}"));
-            assertThrows(DataException.class, () -> task.put(records));
+            String json = "{\"billed_credits\":10.0,\"expiration\":9999999999,\"included_credits\":100,"
+                    + "\"team_billing_email\":\"a@b.c\",\"team_name\":\"Acme\",\"team_plan\":\"Pro\"}";
+            assertDoesNotThrow(() -> task.put(List.of(record("team:1", json, 1L), record("team:2", json, 2L))));
+
+            verify(rejectedCommands).record();
+            verify(mailSender, times(1)).CreateUsageMailRequest(anyString(), anyString(), any(MailContent.class));
+            verify(mailSender, times(1)).SendUsageMailRequest(any(HttpPost.class));
+        });
+    }
+
+    @Test
+    void put_rejectedExpiration_isCountedAndTheTaskCarriesOn() {
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            @SuppressWarnings("unchecked")
+            Response<Long> rejected = mock(Response.class);
+            when(rejected.get()).thenThrow(new JedisDataException("ERR invalid expire time in 'expireat' command"));
+            when(transaction.expireAt(anyString(), anyLong())).thenReturn(rejected);
+
+            assertDoesNotThrow(() -> task.put(List.of(record("team:1", CREDITS_JSON))));
+
+            verify(rejectedCommands).record();
         });
     }
 
@@ -434,10 +511,13 @@ class RedisSinkTaskTest {
 
     @Test
     void put_offsetsNotStored_throwsDataException() {
-        // EXEC returns a rejected command as an exception among its results.
+        // The increments are applied; without the offsets they would be counted again.
         withConnectedRedis(mailSender -> {
             stubIncrByFloat(1.0);
-            when(transaction.exec()).thenReturn(List.of(1.0, 1L, new JedisDataException("WRONGTYPE")));
+            @SuppressWarnings("unchecked")
+            Response<Long> rejected = mock(Response.class);
+            when(rejected.get()).thenThrow(new JedisDataException("WRONGTYPE"));
+            when(transaction.hset(anyString(), anyString(), anyString())).thenReturn(rejected);
 
             assertThrows(DataException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON))));
         });

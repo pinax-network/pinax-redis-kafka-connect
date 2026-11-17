@@ -6,6 +6,7 @@ import java.text.NumberFormat;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -14,8 +15,12 @@ import java.util.concurrent.CompletableFuture;
 import java.util.HashSet;
 
 import org.apache.hc.client5.http.classic.methods.HttpPost;
+import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.config.AbstractConfig;
+import org.apache.kafka.common.metrics.PluginMetrics;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.stats.CumulativeSum;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.errors.DataException;
@@ -55,6 +60,19 @@ public class RedisSinkTask extends SinkTask {
     // Partitions a seek was requested for that Connect has not carried out yet. The
     // batch in hand was read from the old position, so their records are left out.
     private final Set<TopicPartition> seekingPartitions = new HashSet<TopicPartition>();
+
+    // Errors Redis answers with while it cannot take writes for the moment: loading
+    // its dataset, blocked by a script, demoted to a replica, unable to persist, out
+    // of memory, or without enough replicas. Retried, they pass.
+    private static final String[] TRANSIENT_ERRORS = {
+        "LOADING", "BUSY", "READONLY", "MISCONF", "OOM", "MASTERDOWN", "NOREPLICAS", "TRYAGAIN", "CLUSTERDOWN" };
+    private static final String EXECABORT_CAUSE = "EXECABORT Transaction discarded because of: ";
+
+    static final String REJECTED_COMMANDS_METRIC = "rejected-commands-total";
+
+    // Counts the commands of committed batches that Redis rejected. Null when the
+    // Connect worker does not offer plugin metrics.
+    private Sensor rejectedCommands = null;
 
     private void createRedisConnection() {
         // Let connection failures propagate. Callers decide how to react: startup
@@ -110,6 +128,8 @@ public class RedisSinkTask extends SinkTask {
             sentinels.add(redisHostPort);
         }
 
+        registerMetrics();
+
         try {
             createRedisConnection();
         } catch (JedisAccessControlException e) {
@@ -123,6 +143,25 @@ public class RedisSinkTask extends SinkTask {
             // task. Clean up any partial state; put() will (re)connect and retry.
             logger.warn("Could not connect to Redis on startup, will retry on first put", e);
             closeRedisConnection();
+        }
+    }
+
+    private void registerMetrics() {
+        rejectedCommands = null;
+        try {
+            PluginMetrics metrics = context.pluginMetrics();
+            if (metrics == null) {
+                return;
+            }
+            MetricName name = metrics.metricName(REJECTED_COMMANDS_METRIC,
+                    "Commands of committed batches that Redis rejected (wrong key type, value not a number, "
+                            + "invalid expiration). The record's increment or expiration was not applied.",
+                    new LinkedHashMap<String, String>());
+            rejectedCommands = metrics.addSensor("rejected-commands");
+            rejectedCommands.add(name, new CumulativeSum());
+        } catch (NoSuchMethodError | NoClassDefFoundError e) {
+            // Plugin metrics came with Kafka Connect 4.1.
+            logger.warn("This Connect worker has no plugin metrics, {} is only logged", REJECTED_COMMANDS_METRIC);
         }
     }
 
@@ -156,6 +195,10 @@ public class RedisSinkTask extends SinkTask {
         // here, is still the one read from the old positions.
         seekingPartitions.clear();
 
+        // Notifications are at-most-once. The batch is committed in Redis by now, so
+        // if the task stops before or while sending, or a send fails, the batch is
+        // skipped as already applied when it is delivered again and these mails are
+        // not sent. Accepted: the team is notified again at the next milestone.
         sendMails(mailRequests);
     }
 
@@ -221,16 +264,17 @@ public class RedisSinkTask extends SinkTask {
             }
 
             Map<TopicPartition, Long> appliedOffsets = new HashMap<TopicPartition, Long>();
+            List<Response<Long>> offsetResponses = new ArrayList<Response<Long>>();
             Transaction transaction = jedis.multi();
 
             for (PendingWrite write : pendingWrites) {
                 write.response = transaction.incrByFloat(write.key, write.billedCredits);
-                transaction.expireAt(write.key, write.expireAt);
+                write.expireResponse = transaction.expireAt(write.key, write.expireAt);
                 appliedOffsets.merge(write.partition, write.offset, Math::max);
             }
             for (Map.Entry<TopicPartition, Long> applied : appliedOffsets.entrySet()) {
-                transaction.hset(offsetsKey(applied.getKey().topic()),
-                        Integer.toString(applied.getKey().partition()), Long.toString(applied.getValue()));
+                offsetResponses.add(transaction.hset(offsetsKey(applied.getKey().topic()),
+                        Integer.toString(applied.getKey().partition()), Long.toString(applied.getValue())));
             }
 
             List<Object> results = transaction.exec();
@@ -239,12 +283,33 @@ public class RedisSinkTask extends SinkTask {
                 logger.warn("Offsets in Redis changed while writing the batch, will retry it");
                 throw new RetriableException("Offsets in Redis changed while writing the batch");
             }
-            // A command the server rejected is returned as an exception in the
-            // results. Checked for every command, the offsets included: a batch whose
-            // offsets were not stored must not be reported as written.
-            for (Object result : results) {
-                if (result instanceof JedisDataException) {
-                    throw (JedisDataException) result;
+            // The transaction is applied, but Redis does not roll it back when it
+            // rejects one of its commands: that command's Response throws at get().
+            //
+            // Offsets that were not stored fail the task. The increments are applied,
+            // and carrying on would count them again after the next restart.
+            for (Response<Long> offsetResponse : offsetResponses) {
+                try {
+                    offsetResponse.get();
+                } catch (JedisDataException e) {
+                    throw new DataException("Batch applied to Redis but its offsets were not stored", e);
+                }
+            }
+            // A rejected increment or expiration concerns one record only (its key
+            // holds another type or no number, its expiration is out of range). The
+            // rest of the batch is applied and nothing can be retried, so it is
+            // reported and the task carries on.
+            for (PendingWrite write : pendingWrites) {
+                try {
+                    write.newBilledCredits = write.response.get();
+                } catch (JedisDataException e) {
+                    write.incrementRejected = true;
+                    reportRejected("INCRBYFLOAT", write, e);
+                }
+                try {
+                    write.expireResponse.get();
+                } catch (JedisDataException e) {
+                    reportRejected("EXPIREAT", write, e);
                 }
             }
 
@@ -260,12 +325,18 @@ public class RedisSinkTask extends SinkTask {
             closeRedisConnection();
             throw new ConnectException("Redis access control error", e);
         } catch (JedisDataException e) {
-            // Server rejected the command (e.g. WRONGTYPE, value not a valid float).
-            // Permanent for this batch — retrying would loop forever and hide the
-            // real data problem, so surface it as a non-retriable DataException.
-            // Redis does not roll a transaction back: the other commands of the batch
-            // are applied. When it was an increment that failed, the offsets are
-            // stored and the batch is not counted again once the task is restarted.
+            if (isTransient(e)) {
+                // Redis refused the read or the whole transaction because it cannot
+                // take writes right now. Nothing was applied, so retry the batch. On
+                // a new connection: after a failover the sentinels name another
+                // master.
+                logger.warn("Redis is temporarily not accepting writes, will retry batch", e);
+                closeRedisConnection();
+                throw new RetriableException("Redis is temporarily not accepting writes", e);
+            }
+            // Server refused a read or the whole transaction for a reason retrying
+            // cannot fix (e.g. the offset hash holds another type). Surface it as a
+            // non-retriable DataException instead of looping on it.
             logger.error("Redis command/data error", e);
             closeRedisConnection();
             throw new DataException("Redis command/data error", e);
@@ -286,6 +357,50 @@ public class RedisSinkTask extends SinkTask {
             closeRedisConnection();
             throw new DataException("Non-retriable error while writing batch to Redis", e);
         }
+    }
+
+    private void reportRejected(String command, PendingWrite write, JedisDataException e) {
+        logger.error("Redis rejected {} for key {} (record {} offset {}), the rest of the batch is applied: {}",
+                command, write.key, write.partition, write.offset, e.getMessage());
+        if (rejectedCommands != null) {
+            rejectedCommands.record();
+        }
+    }
+
+    /**
+     * Whether Redis refused a command, or a transaction as a whole, for a reason that
+     * passes. A discarded transaction (EXECABORT) names the reason in its message or,
+     * when a command was refused while it was queued, carries the refusals as
+     * suppressed exceptions; it is transient when all of them are.
+     */
+    static boolean isTransient(JedisDataException e) {
+        String message = e.getMessage() == null ? "" : e.getMessage();
+        if (message.startsWith(EXECABORT_CAUSE)) {
+            message = message.substring(EXECABORT_CAUSE.length());
+        }
+        if (isTransientError(message)) {
+            return true;
+        }
+
+        Throwable[] refusals = e.getSuppressed();
+        for (Throwable refusal : refusals) {
+            if (!(refusal instanceof JedisDataException) || !isTransientError(refusal.getMessage())) {
+                return false;
+            }
+        }
+        return refusals.length > 0;
+    }
+
+    private static boolean isTransientError(String message) {
+        if (message == null) {
+            return false;
+        }
+        for (String error : TRANSIENT_ERRORS) {
+            if (message.equals(error) || message.startsWith(error + " ")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void sendMails(List<HttpPost> mailRequests) {
@@ -415,11 +530,11 @@ public class RedisSinkTask extends SinkTask {
         List<HttpPost> mailRequests = new ArrayList<HttpPost>();
 
         for (PendingWrite write : pendingWrites) {
-            // Read the result outside the try below: Jedis surfaces a per-command
-            // server error (e.g. WRONGTYPE, "value is not a valid float") here at
-            // get(), not at exec(). Letting it propagate routes it to put()'s
-            // JedisDataException handler instead of silently dropping a failed write.
-            double newBilledCredits = write.response.get();
+            // Nothing was added for this record, so it crossed no milestone.
+            if (write.incrementRejected) {
+                continue;
+            }
+            double newBilledCredits = write.newBilledCredits;
             double oldBilledCredits = newBilledCredits - write.billedCredits;
 
             try {
@@ -469,7 +584,6 @@ public class RedisSinkTask extends SinkTask {
             } catch (JSONException e) {
                 // Only a malformed/missing notification field is skippable — the Redis
                 // write already succeeded, so don't fail the batch over a bad email.
-                // Redis/infra errors are NOT caught here; they propagate to put().
                 logger.error("Skipping usage notification for malformed record: key={}", write.key, e);
             }
         }
@@ -492,8 +606,8 @@ public class RedisSinkTask extends SinkTask {
     }
 
     /**
-     * A parsed sink record awaiting its write. {@code response} holds the new
-     * billed-credits value once the transaction is executed.
+     * A parsed sink record awaiting its write. The responses hold the results of its
+     * commands once the transaction is executed.
      */
     private static final class PendingWrite {
         final TopicPartition partition;
@@ -503,6 +617,9 @@ public class RedisSinkTask extends SinkTask {
         final long expireAt;
         final JSONObject json;
         Response<Double> response;
+        Response<Long> expireResponse;
+        double newBilledCredits;
+        boolean incrementRejected;
 
         PendingWrite(TopicPartition partition, long offset, String key, double billedCredits, long expireAt,
                 JSONObject json) {
