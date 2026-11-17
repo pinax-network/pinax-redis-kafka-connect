@@ -584,7 +584,8 @@ public class RedisSinkTask extends SinkTask {
      * the stored offset. That is what replays the missing records after Redis was
      * restored from a snapshot, whose counters and offsets are both from the time of
      * the snapshot. It does not wait for a record, so a partition nothing is produced
-     * to is replayed as well.
+     * to is replayed as well. A partition whose batch in hand already continues right
+     * after the stored offset is left where it is.
      *
      * <p>A partition without a stored offset (first start with this version, or an
      * empty Redis) stays where the consumer group has it.
@@ -594,10 +595,13 @@ public class RedisSinkTask extends SinkTask {
             return;
         }
 
-        // Where the batch in hand starts, to tell how far back a partition is moved.
+        // Where the batch in hand starts and ends, to tell whether a partition has to
+        // be moved at all, and how far back.
         Map<TopicPartition, Long> firstInHand = new HashMap<TopicPartition, Long>();
+        Map<TopicPartition, Long> lastInHand = new HashMap<TopicPartition, Long>();
         for (PendingWrite write : pendingWrites) {
             firstInHand.merge(write.partition, write.offset, Math::min);
+            lastInHand.merge(write.partition, write.offset, Math::max);
         }
 
         // The offsets were read before this is called: a failure to read them leaves
@@ -611,6 +615,15 @@ public class RedisSinkTask extends SinkTask {
             Long storedOffset = storedOffsets.get(partition);
             if (storedOffset != null) {
                 Long first = firstInHand.get(partition);
+                if (first != null && first <= storedOffset + 1 && lastInHand.get(partition) > storedOffset) {
+                    // The batch in hand starts at or before the record after the
+                    // stored offset and reaches beyond it, so it holds the records to
+                    // continue with. Nothing to move or read again; what it holds at
+                    // or below the stored offset is skipped as already applied.
+                    logger.debug("{} continues in the batch in hand, after stored offset {}", partition,
+                            storedOffset);
+                    continue;
+                }
                 if (first != null && first > storedOffset + 1) {
                     // Expected after Redis was restored or lost writes in a failover.
                     // Otherwise the offsets in Redis are stale (written by this

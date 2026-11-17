@@ -500,6 +500,70 @@ class RedisSinkTaskTest {
     }
 
     @Test
+    void assignedPartition_batchContinuesAfterTheStoredOffset_isNotMoved() {
+        // The usual case: nothing was lost, so nothing has to be read again.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            storedOffset(5L);
+
+            task.open(List.of(PARTITION));
+            task.put(List.of(record("team:1", CREDITS_JSON, 6L), record("team:1", CREDITS_JSON, 7L)));
+
+            verify(context, never()).offset(any(TopicPartition.class), anyLong());
+            verify(transaction, times(2)).incrByFloat("team:1", 1.0);
+            verify(transaction).hset(OFFSETS_KEY, "0", "7");
+        });
+    }
+
+    @Test
+    void assignedPartition_batchOverlapsTheStoredOffset_isNotMovedAndSkipsWhatIsApplied() {
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            storedOffset(5L);
+
+            task.open(List.of(PARTITION));
+            task.put(List.of(record("team:1", CREDITS_JSON, 5L), record("team:1", CREDITS_JSON, 6L)));
+
+            verify(context, never()).offset(any(TopicPartition.class), anyLong());
+            verify(transaction, times(1)).incrByFloat("team:1", 1.0);
+            verify(transaction).hset(OFFSETS_KEY, "0", "6");
+        });
+    }
+
+    @Test
+    void assignedPartition_batchEntirelyApplied_isMovedForwardToTheStoredOffset() {
+        // The consumer group is behind Redis: jump ahead instead of reading through.
+        withConnectedRedis(mailSender -> {
+            storedOffset(5L);
+
+            task.open(List.of(PARTITION));
+            task.put(List.of(record("team:1", CREDITS_JSON, 2L), record("team:1", CREDITS_JSON, 3L)));
+
+            verify(context).offset(PARTITION, 6L);
+            verify(jedis, never()).multi();
+        });
+    }
+
+    @Test
+    void reconnect_nothingLost_theBatchIsAppliedWithoutReadingItAgain() {
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            when(context.assignment()).thenReturn(Set.of(PARTITION));
+            storedOffset(8L);
+            when(transaction.exec()).thenThrow(new JedisConnectionException("connection reset"))
+                    .thenReturn(List.of());
+
+            List<SinkRecord> batch = List.of(record("team:1", CREDITS_JSON, 9L));
+            assertThrows(RetriableException.class, () -> task.put(batch));
+            task.put(batch);
+
+            verify(context, never()).offset(any(TopicPartition.class), anyLong());
+            verify(transaction, times(2)).incrByFloat(anyString(), anyDouble());
+            verify(transaction, times(2)).hset(OFFSETS_KEY, "0", "9");
+        });
+    }
+
+    @Test
     void assignedPartition_staysLeftOutWhenTheBatchIsRetried() {
         // Partition 0 is moved back, partition 1 is written and that fails. Connect
         // delivers the same batch again: applying partition 0's records now would

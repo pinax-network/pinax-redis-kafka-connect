@@ -147,12 +147,13 @@ multiples of the allowance. If a single batch leaps past several at once, only t
 - **Redis decides where a partition continues.** When a partition is assigned, the
   task moves the consumer to the record after the stored offset, whatever the consumer
   group has committed. It does so on the next `put()`, which Connect also calls without
-  records, so a partition nothing is produced to is covered too. Records of that
-  partition already in hand are left out and arrive again from the new position. A
+  records, so a partition nothing is produced to is covered too. A partition whose
+  batch in hand already continues right after the stored offset is left where it is;
+  otherwise its records in hand are left out and arrive again from the new position. A
   partition without a stored offset stays where the consumer group has it.
   The same is done for all assigned partitions whenever the task reconnects to Redis:
   after a Sentinel failover the new master may lack the last writes, and it then
-  continues from the offsets it holds. The batch in hand is read once more from Kafka.
+  continues from the offsets it holds.
 - **Transformations.** Offsets are stored and compared by the topic, partition and
   offset a record was read from, so a transformation that renames the topic does not
   affect them. The hash is named after the source topic.
