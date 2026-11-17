@@ -64,6 +64,7 @@ and restart the worker.
 | `offsetsKey`      | no       | `kafka-connect:redis-sink:offsets` | Prefix of the hashes holding the applied offsets, one per topic (`<offsetsKey>:<topic>`). |
 | `retryBackoffMs`  | no       | `5000`               | Milliseconds before a batch is retried after Redis was unreachable. |
 | `conflictRetryBackoffMs` | no | `1000`              | Milliseconds before a batch is retried after its transaction was refused because the stored offsets changed. |
+| `maxRetries`      | no       | `12`                 | How often in a row a batch is retried before the task fails. About a minute with the default backoff. |
 | `from`            | no       | `info@pinax.network` | `From` address for notification emails (must be a valid email). |
 | `mailchimpApiKey` | **yes**  | —                    | Mandrill / Mailchimp Transactional API key.                     |
 | `templateSlug`    | **yes**  | —                    | Mandrill template name used to render the usage email.          |
@@ -192,7 +193,10 @@ multiples of the allowance. If a single batch leaps past several at once, only t
   nothing is applied and the batch is retried after `conflictRetryBackoffMs`.
 - **Retries.** A batch that failed for a passing reason is delivered again by Connect
   after `retryBackoffMs` (Redis unreachable) or
-  `conflictRetryBackoffMs` (transaction refused).
+  `conflictRetryBackoffMs` (transaction refused). Connect would do so forever, with the
+  task `RUNNING` while nothing is counted. After `maxRetries` retries in a row without a
+  batch going through, the task fails instead, which shows in its status and leaves it
+  to whatever restarts failed tasks.
 - **Not rolled back.** Redis does not undo a transaction when it rejects one of its
   commands: the rest of the batch and the offsets are applied.
   - A rejected increment or expiration (`WRONGTYPE`, "not a valid float", "invalid expire
@@ -220,8 +224,8 @@ multiples of the allowance. If a single batch leaps past several at once, only t
 
   | Failure | Mapped to | Effect |
   |---|---|---|
-  | Connection loss, pool exhaustion, sentinel failover (`JedisException`) | `RetriableException` | Connect retries the batch |
-  | Offsets changed by another task between `WATCH` and `EXEC` | `RetriableException` | Connect retries the batch |
+  | Connection loss, pool exhaustion, sentinel failover (`JedisException`) | `RetriableException` | Connect retries the batch; the task fails after `maxRetries` in a row |
+  | Offsets changed by another task between `WATCH` and `EXEC` | `RetriableException` | Connect retries the batch; the task fails after `maxRetries` in a row |
   | Auth / ACL error (`JedisAccessControlException`) | `ConnectException` | Task fails fast (permanent misconfig) |
   | Redis reachable but refusing reads or writes — `LOADING`, `BUSY`, `READONLY`, `MISCONF`, `OOM`, also as the reason of an `EXECABORT` (`JedisDataException`) | `DataException` | Nothing was applied; the task fails and is left to whatever restarts failed tasks |
   | Kafka does not have the offset stored in Redis | `ConnectException` | Task fails before anything is written; the offset hash belongs to another topic or cluster |

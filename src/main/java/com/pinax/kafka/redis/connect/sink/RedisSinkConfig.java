@@ -10,6 +10,7 @@ public class RedisSinkConfig {
         public static final String OFFSETS_KEY = "offsetsKey";
         public static final String RETRY_BACKOFF_MS = "retryBackoffMs";
         public static final String CONFLICT_RETRY_BACKOFF_MS = "conflictRetryBackoffMs";
+        public static final String MAX_RETRIES = "maxRetries";
 
         // Email sink configuration
         public static final String FROM = "from";
@@ -51,6 +52,14 @@ public class RedisSinkConfig {
                                         "Time in milliseconds before a batch is retried after Redis refused "
                                                         + "its transaction because the stored offsets were "
                                                         + "changed by another task")
+                        .define(MAX_RETRIES,
+                                        ConfigDef.Type.INT,
+                                        12,
+                                        ConfigDef.Range.atLeast(0),
+                                        ConfigDef.Importance.LOW,
+                                        "How often in a row a batch is retried before the task fails. With "
+                                                        + "the default backoff that is about a minute of Redis "
+                                                        + "being unreachable")
                         .define(FROM,
                                         ConfigDef.Type.STRING,
                                         "info@pinax.network", // TODO: change to correct email

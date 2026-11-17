@@ -55,6 +55,10 @@ public class RedisSinkTask extends SinkTask {
     private String offsetsKey;
     private long retryBackoffMs;
     private long conflictRetryBackoffMs;
+    private int maxRetries;
+
+    // Attempts that ended in a retry since the last batch that went through.
+    private int retries = 0;
 
     // Partitions assigned to this task whose consumer has not been moved to the offset
     // stored in Redis yet, see seekToStoredOffsets().
@@ -121,6 +125,8 @@ public class RedisSinkTask extends SinkTask {
         offsetsKey = config.getString(RedisSinkConfig.OFFSETS_KEY);
         retryBackoffMs = config.getLong(RedisSinkConfig.RETRY_BACKOFF_MS);
         conflictRetryBackoffMs = config.getLong(RedisSinkConfig.CONFLICT_RETRY_BACKOFF_MS);
+        maxRetries = config.getInt(RedisSinkConfig.MAX_RETRIES);
+        retries = 0;
         unseekedPartitions.clear();
         seekingPartitions.clear();
         soughtOffsets.clear();
@@ -206,6 +212,7 @@ public class RedisSinkTask extends SinkTask {
         }
 
         List<HttpPost> mailRequests = writeToRedis(records);
+        retries = 0;
 
         // Connect carries out the requested seeks before it polls again. Only a
         // batch it delivers again after a RetriableException, which never gets
@@ -298,8 +305,7 @@ public class RedisSinkTask extends SinkTask {
             if (results == null) {
                 // Nothing was applied. Not an error of this batch, so retry it.
                 logger.warn("Offsets in Redis changed while writing the batch, will retry it");
-                context.timeout(conflictRetryBackoffMs);
-                throw new RetriableException("Offsets in Redis changed while writing the batch");
+                throw retry("Offsets in Redis changed while writing the batch", null, conflictRetryBackoffMs);
             }
             // The transaction is applied, but Redis does not roll it back when it
             // rejects one of its commands: that command's Response throws at get().
@@ -363,8 +369,7 @@ public class RedisSinkTask extends SinkTask {
             // sentinel failover — all transient. Drop the connection and retry.
             logger.error("Redis connection error, will retry batch", e);
             closeRedisConnection();
-            context.timeout(retryBackoffMs);
-            throw new RetriableException("Redis connection error", e);
+            throw retry("Redis connection error", e, retryBackoffMs);
         } catch (Exception e) {
             // Unexpected non-retriable failure while writing the batch to Redis.
             // (Malformed payloads are caught during parsing above, and a bad
@@ -375,6 +380,21 @@ public class RedisSinkTask extends SinkTask {
             closeRedisConnection();
             throw new DataException("Non-retriable error while writing batch to Redis", e);
         }
+    }
+
+    /**
+     * Returns the exception that makes Connect deliver the batch again after
+     * {@code backoffMs}. Connect itself never stops doing so, and the task would stay
+     * RUNNING while nothing is counted; after maxRetries in a row the task fails
+     * instead, which shows, and hands over to whatever restarts failed tasks.
+     */
+    private RetriableException retry(String message, Throwable cause, long backoffMs) {
+        if (retries >= maxRetries) {
+            throw new ConnectException(message + ", giving up after " + retries + " retries", cause);
+        }
+        retries++;
+        context.timeout(backoffMs);
+        return new RetriableException(message, cause);
     }
 
     private void parse(List<PendingWrite> pendingWrites) {

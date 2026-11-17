@@ -1,6 +1,7 @@
 package com.pinax.kafka.redis.connect.sink;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyDouble;
@@ -8,6 +9,8 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.startsWith;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockConstruction;
 import static org.mockito.Mockito.never;
@@ -161,6 +164,38 @@ class RedisSinkTaskTest {
                     record("team:1", "{\"billed_credits\":1.0,\"expiration\":9999999999}"));
             assertThrows(RetriableException.class, () -> task.put(records));
             verify(context).timeout(5000L);
+        });
+    }
+
+    @Test
+    void put_redisStaysUnreachable_failsTheTaskAfterMaxRetries() {
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            when(transaction.exec()).thenThrow(new JedisConnectionException("connection reset"));
+            List<SinkRecord> batch = List.of(record("team:1", CREDITS_JSON));
+
+            for (int retry = 0; retry < 12; retry++) {
+                assertThrows(RetriableException.class, () -> task.put(batch));
+            }
+            ConnectException givenUp = assertThrows(ConnectException.class, () -> task.put(batch));
+            assertFalse(givenUp instanceof RetriableException);
+        });
+    }
+
+    @Test
+    void put_batchWentThrough_startsCountingRetriesAgain() {
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            List<SinkRecord> batch = List.of(record("team:1", CREDITS_JSON));
+
+            for (int round = 0; round < 2; round++) {
+                doThrow(new JedisConnectionException("connection reset")).when(transaction).exec();
+                for (int retry = 0; retry < 12; retry++) {
+                    assertThrows(RetriableException.class, () -> task.put(batch));
+                }
+                doReturn(List.of()).when(transaction).exec();
+                assertDoesNotThrow(() -> task.put(batch));
+            }
         });
     }
 
