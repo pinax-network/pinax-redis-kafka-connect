@@ -251,6 +251,11 @@ public class RedisSinkTask extends SinkTask {
         try {
             if (jedis == null) {
                 createRedisConnection();
+                // The Redis behind a new connection may be another one than before:
+                // a replica promoted in a failover that had not received the last
+                // writes, or a restored snapshot. Its counters and offsets belong
+                // together, so continue every partition from the offsets it holds.
+                unseekedPartitions.addAll(context.assignment());
             }
 
             seekToStoredOffsets();

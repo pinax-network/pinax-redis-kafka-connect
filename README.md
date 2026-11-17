@@ -147,6 +147,9 @@ multiples of the allowance. If a single batch leaps past several at once, only t
   records, so a partition nothing is produced to is covered too. Records of that
   partition already in hand are left out and arrive again from the new position. A
   partition without a stored offset stays where the consumer group has it.
+  The same is done for all assigned partitions whenever the task reconnects to Redis:
+  after a Sentinel failover the new master may lack the last writes, and it then
+  continues from the offsets it holds. The batch in hand is read once more from Kafka.
 - **Transformations.** Offsets are stored and compared by the topic, partition and
   offset a record was read from, so a transformation that renames the topic does not
   affect them. The hash is named after the source topic.

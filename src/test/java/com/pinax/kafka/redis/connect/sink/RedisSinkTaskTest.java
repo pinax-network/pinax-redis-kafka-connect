@@ -20,6 +20,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.hc.client5.http.classic.methods.HttpPost;
 import org.apache.kafka.common.TopicPartition;
@@ -476,6 +477,30 @@ class RedisSinkTaskTest {
 
             task.put(Collections.emptyList());
             verify(context).offset(PARTITION, 6L);
+        });
+    }
+
+    @Test
+    void reconnect_movesTheAssignedPartitionsToTheOffsetsOfTheNewRedis() {
+        // A failover promoted a replica that is behind: offset 8 was stored on the
+        // old master, the new one holds 5.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            when(context.assignment()).thenReturn(Set.of(PARTITION));
+            storedOffset(8L);
+            when(transaction.exec()).thenThrow(new JedisConnectionException("connection reset"))
+                    .thenReturn(List.of());
+
+            List<SinkRecord> batch = List.of(record("team:1", CREDITS_JSON, 9L));
+            assertThrows(RetriableException.class, () -> task.put(batch));
+            verify(context, never()).offset(any(TopicPartition.class), anyLong());
+
+            storedOffset(5L);
+            task.put(batch);
+
+            // Replayed from offset 6; the batch in hand is left out and read again.
+            verify(context).offset(PARTITION, 6L);
+            verify(transaction, times(1)).incrByFloat(anyString(), anyDouble());
         });
     }
 
