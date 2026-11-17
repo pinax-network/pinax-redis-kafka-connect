@@ -269,8 +269,8 @@ public class RedisSinkTask extends SinkTask {
         // rewind of the consumer group is skipped instead of being counted twice.
         //
         // The offset keys are WATCHed, so the transaction is refused when another task
-        // (one that lost its partitions but has not noticed yet) stored offsets in
-        // between; the batch is then retried against the new offsets.
+        // (one that was replaced but has not noticed yet) stored offsets in between;
+        // the batch is then retried against the new offsets.
         //
         // The whole batch shares one try/catch so any Redis failure (connection, pool,
         // sentinel) maps to a single RetriableException. Each sets the time after
@@ -286,13 +286,17 @@ public class RedisSinkTask extends SinkTask {
                 unseekedPartitions.addAll(context.assignment());
             }
 
-            seekToStoredOffsets(pendingWrites);
-
-            Map<TopicPartition, Long> storedOffsets = watchStoredOffsets(pendingWrites);
+            // One read serves both: where to move newly assigned partitions to, and
+            // which records of the batch are applied already.
+            boolean watching = !pendingWrites.isEmpty();
+            Map<TopicPartition, Long> storedOffsets = readStoredOffsets(pendingWrites, watching);
+            seekToStoredOffsets(pendingWrites, storedOffsets);
             pendingWrites = notYetApplied(pendingWrites, storedOffsets);
 
             if (pendingWrites.isEmpty()) {
-                jedis.unwatch();
+                if (watching) {
+                    jedis.unwatch();
+                }
                 return new ArrayList<HttpPost>();
             }
 
@@ -491,18 +495,30 @@ public class RedisSinkTask extends SinkTask {
     }
 
     /**
-     * WATCHes the offset hash of every topic in the batch and returns the offsets
-     * stored in them: per partition, the offset of the last record applied to Redis.
+     * Returns the offsets stored in Redis, per partition the offset of the last record
+     * applied, for every topic of the batch and of the partitions still to be moved.
+     * With {@code watch}, the offset hashes are WATCHed before they are read, so a
+     * transaction that follows is refused when they changed in between.
      */
-    private Map<TopicPartition, Long> watchStoredOffsets(List<PendingWrite> pendingWrites) {
+    private Map<TopicPartition, Long> readStoredOffsets(List<PendingWrite> pendingWrites, boolean watch) {
         Set<String> topics = new HashSet<String>();
         for (PendingWrite write : pendingWrites) {
             topics.add(write.partition.topic());
         }
+        for (TopicPartition partition : unseekedPartitions) {
+            topics.add(partition.topic());
+        }
+
+        if (watch) {
+            List<String> keys = new ArrayList<String>();
+            for (String topic : topics) {
+                keys.add(offsetsKey(topic));
+            }
+            jedis.watch(keys.toArray(new String[0]));
+        }
 
         Map<TopicPartition, Long> storedOffsets = new HashMap<TopicPartition, Long>();
         for (String topic : topics) {
-            jedis.watch(offsetsKey(topic));
             readStoredOffsets(topic, storedOffsets);
         }
         return storedOffsets;
@@ -531,7 +547,7 @@ public class RedisSinkTask extends SinkTask {
      * <p>A partition without a stored offset (first start with this version, or an
      * empty Redis) stays where the consumer group has it.
      */
-    private void seekToStoredOffsets(List<PendingWrite> pendingWrites) {
+    private void seekToStoredOffsets(List<PendingWrite> pendingWrites, Map<TopicPartition, Long> storedOffsets) {
         if (unseekedPartitions.isEmpty()) {
             return;
         }
@@ -542,16 +558,8 @@ public class RedisSinkTask extends SinkTask {
             firstInHand.merge(write.partition, write.offset, Math::min);
         }
 
-        Set<String> topics = new HashSet<String>();
-        for (TopicPartition partition : unseekedPartitions) {
-            topics.add(partition.topic());
-        }
-        // Read everything first: a failure leaves the partitions to the next put().
-        Map<TopicPartition, Long> storedOffsets = new HashMap<TopicPartition, Long>();
-        for (String topic : topics) {
-            readStoredOffsets(topic, storedOffsets);
-        }
-
+        // The offsets were read before this is called: a failure to read them leaves
+        // the partitions to the next put().
         Set<String> topicsWithOffsets = new HashSet<String>();
         for (TopicPartition stored : storedOffsets.keySet()) {
             topicsWithOffsets.add(stored.topic());
