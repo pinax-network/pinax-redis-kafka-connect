@@ -8,7 +8,6 @@ import static org.mockito.ArgumentMatchers.anyDouble;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.ArgumentMatchers.startsWith;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -26,8 +25,6 @@ import java.util.Set;
 
 import org.apache.hc.client5.http.classic.methods.HttpPost;
 import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.common.metrics.PluginMetrics;
-import org.apache.kafka.common.metrics.Sensor;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.errors.RetriableException;
@@ -61,7 +58,6 @@ class RedisSinkTaskTest {
     private Jedis jedis;
     private Transaction transaction;
     private SinkTaskContext context;
-    private Sensor rejectedCommands;
     private RedisSinkTask task;
 
     @BeforeEach
@@ -75,10 +71,6 @@ class RedisSinkTaskTest {
         when(transaction.expireAt(anyString(), anyLong())).thenReturn(mock(Response.class));
         when(transaction.hset(anyString(), anyString(), anyString())).thenReturn(mock(Response.class));
         context = mock(SinkTaskContext.class);
-        PluginMetrics metrics = mock(PluginMetrics.class);
-        rejectedCommands = mock(Sensor.class);
-        when(context.pluginMetrics()).thenReturn(metrics);
-        when(metrics.addSensor(startsWith("rejected-commands-"))).thenReturn(rejectedCommands);
         task = new RedisSinkTask();
         task.initialize(context);
     }
@@ -143,14 +135,46 @@ class RedisSinkTaskTest {
     }
 
     @Test
-    void put_malformedJson_throwsDataExceptionAndWritesNothing() {
+    void put_malformedJson_appliesTheRecordsBeforeItThenFails() {
+        // The stored offset ends up right before the record that cannot be parsed,
+        // so moving it by hand skips nothing else.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            List<SinkRecord> records = List.of(record("team:1", CREDITS_JSON, 7L),
+                    record("team:2", "this is not json", 8L), record("team:3", CREDITS_JSON, 9L));
+
+            assertThrows(DataException.class, () -> task.put(records));
+
+            verify(transaction, times(1)).incrByFloat(anyString(), anyDouble());
+            verify(transaction).incrByFloat(eq("team:1"), anyDouble());
+            verify(transaction).hset(OFFSETS_KEY, "0", "7");
+        });
+    }
+
+    @Test
+    void put_malformedJsonFirst_failsAndWritesNothing() {
         withConnectedRedis(mailSender -> {
             List<SinkRecord> records = List.of(
-                    record("team:1", CREDITS_JSON, 7L), record("team:2", "this is not json", 8L));
+                    record("team:2", "this is not json", 8L), record("team:3", CREDITS_JSON, 9L));
 
             assertThrows(DataException.class, () -> task.put(records));
 
             verify(jedis, never()).multi();
+        });
+    }
+
+    @Test
+    void put_malformedJson_doesNotHoldUpOtherPartitions() {
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            List<SinkRecord> records = List.of(record("team:2", "this is not json", 8L),
+                    new SinkRecord("usage", 1, null, "team:3", null, CREDITS_JSON, 3L));
+
+            assertThrows(DataException.class, () -> task.put(records));
+
+            verify(transaction).incrByFloat(eq("team:3"), anyDouble());
+            verify(transaction).hset(OFFSETS_KEY, "1", "3");
+            verify(transaction, never()).hset(eq(OFFSETS_KEY), eq("0"), anyString());
         });
     }
 
@@ -179,6 +203,23 @@ class RedisSinkTaskTest {
             }
             ConnectException givenUp = assertThrows(ConnectException.class, () -> task.put(batch));
             assertFalse(givenUp instanceof RetriableException);
+        });
+    }
+
+    @Test
+    void put_retriedBatchIsGone_startsCountingRetriesAgain() {
+        // Its partitions were revoked: Connect drops the batch and calls put() empty.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            doThrow(new JedisConnectionException("connection reset")).when(transaction).exec();
+            List<SinkRecord> batch = List.of(record("team:1", CREDITS_JSON));
+
+            for (int retry = 0; retry < 12; retry++) {
+                assertThrows(RetriableException.class, () -> task.put(batch));
+            }
+            task.put(Collections.emptyList());
+
+            assertThrows(RetriableException.class, () -> task.put(batch));
         });
     }
 
@@ -252,16 +293,6 @@ class RedisSinkTaskTest {
     }
 
     @Test
-    void start_metricCannotBeRegistered_isTolerated() {
-        when(context.pluginMetrics()).thenThrow(new IllegalArgumentException("A metric named x already exists"));
-        withConnectedRedis(mailSender -> {
-            stubIncrByFloat(1.0);
-
-            assertDoesNotThrow(() -> task.put(List.of(record("team:1", CREDITS_JSON))));
-        });
-    }
-
-    @Test
     void assignedPartition_kafkaDoesNotHaveTheStoredOffset_failsTheTask() {
         // The hash is from another topic or cluster: offset 5000 is beyond the end of
         // this partition, so the consumer starts over at the earliest record.
@@ -278,7 +309,7 @@ class RedisSinkTaskTest {
     }
 
     @Test
-    void put_rejectedIncrement_isCountedAndTheRestOfTheBatchIsNotified() {
+    void put_rejectedIncrement_failsTheTaskOnceTheRestOfTheBatchIsNotified() {
         // Redis does not roll the transaction back: the rejected command's Response
         // throws at get(), the other record is applied and gets its notification.
         withConnectedRedis(mailSender -> {
@@ -293,16 +324,16 @@ class RedisSinkTaskTest {
 
             String json = "{\"billed_credits\":10.0,\"expiration\":9999999999,\"included_credits\":100,"
                     + "\"team_billing_email\":\"a@b.c\",\"team_name\":\"Acme\",\"team_plan\":\"Pro\"}";
-            assertDoesNotThrow(() -> task.put(List.of(record("team:1", json, 1L), record("team:2", json, 2L))));
+            assertThrows(DataException.class,
+                    () -> task.put(List.of(record("team:1", json, 1L), record("team:2", json, 2L))));
 
-            verify(rejectedCommands).record();
             verify(mailSender, times(1)).CreateUsageMailRequest(anyString(), anyString(), any(MailContent.class));
             verify(mailSender, times(1)).SendUsageMailRequest(any(HttpPost.class));
         });
     }
 
     @Test
-    void put_rejectedExpiration_isCountedAndTheTaskCarriesOn() {
+    void put_rejectedExpiration_failsTheTask() {
         withConnectedRedis(mailSender -> {
             stubIncrByFloat(1.0);
             @SuppressWarnings("unchecked")
@@ -310,9 +341,7 @@ class RedisSinkTaskTest {
             when(rejected.get()).thenThrow(new JedisDataException("ERR invalid expire time in 'expireat' command"));
             when(transaction.expireAt(anyString(), anyLong())).thenReturn(rejected);
 
-            assertDoesNotThrow(() -> task.put(List.of(record("team:1", CREDITS_JSON))));
-
-            verify(rejectedCommands).record();
+            assertThrows(DataException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON))));
         });
     }
 

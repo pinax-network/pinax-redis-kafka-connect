@@ -69,6 +69,8 @@ and restart the worker.
 | `mailchimpApiKey` | **yes**  | —                    | Mandrill / Mailchimp Transactional API key.                     |
 | `templateSlug`    | **yes**  | —                    | Mandrill template name used to render the usage email.          |
 
+Needs a Kafka Connect worker of version 3.6 or later.
+
 Plus the standard Kafka Connect sink properties (`topics`, converters, `errors.*`, …).
 `tasks.max` must be `1`: a config with a higher value is rejected, see "A single task"
 below.
@@ -201,21 +203,17 @@ multiples of the allowance. If a single batch leaps past several at once, only t
   commands: the rest of the batch and the offsets are applied.
   - A rejected increment or expiration (`WRONGTYPE`, "not a valid float", "invalid expire
     time") concerns a single record. It is logged as an error with the key, topic,
-    partition and offset, counted in the `rejected-commands-total` metric, and the task
-    carries on. That record's increment or expiration is lost and it sends no
-    notification; the other records of the batch do.
+    partition and offset. The notifications of the other records are sent, then the
+    task fails with a `DataException`. After a restart it continues behind that batch;
+    the rejected increment or expiration is lost.
   - Offsets that could not be stored fail the task with a `DataException`: carrying on
     would count the batch again after the next restart.
 - **Invalid records fail the task.** A record whose value is not JSON or lacks
-  `billed_credits` or `expiration` fails its batch with a `DataException` before
-  anything of it is written. The stored offset stays before the batch, so the task fails
-  on the same record again after a restart, until the producer's data is dealt with and
-  the partition is moved past the record by hand (below). Records at or below the stored
-  offset are not parsed, so that gets the task past it.
-- **Metric.** `rejected-commands-total` counts the rejected commands above. It is a
-  Connect plugin metric (JMX: `kafka.connect:type=plugins,connector=…,task=…`) and needs
-  a Kafka Connect 4.1+ worker; on older workers the rejections are only logged. Alert
-  on any increase.
+  `billed_credits` or `expiration` fails the task with a `DataException`. The records
+  before it in its partition, and those of other partitions, are applied first, so the
+  stored offset ends up right before it. The task fails on the same record again after
+  a restart, until the partition is moved to the record by hand (below): records at or
+  below the stored offset are not parsed, and nothing else is skipped.
 - **Moving a partition by hand.** Resetting the consumer group has no effect on a
   partition with a stored offset. To skip or repeat records, stop the connector, set the
   offset of the last record to treat as applied with
@@ -229,9 +227,9 @@ multiples of the allowance. If a single batch leaps past several at once, only t
   | Auth / ACL error (`JedisAccessControlException`) | `ConnectException` | Task fails fast (permanent misconfig) |
   | Redis reachable but refusing reads or writes — `LOADING`, `BUSY`, `READONLY`, `MISCONF`, `OOM`, also as the reason of an `EXECABORT` (`JedisDataException`) | `DataException` | Nothing was applied; the task fails and is left to whatever restarts failed tasks |
   | Kafka does not have the offset stored in Redis | `ConnectException` | Task fails before anything is written; the offset hash belongs to another topic or cluster |
-  | Increment or expiration of one record rejected inside the transaction | none | Logged, counted in `rejected-commands-total`, task carries on |
+  | Increment or expiration of one record rejected inside the transaction | `DataException` | Logged; the rest of the batch is applied and notified, then the task fails |
   | Offsets rejected inside the transaction, or another permanent error on the offset hash (`JedisDataException`) | `DataException` | Non-retriable (retrying can't help) |
-  | Record value that cannot be parsed (`JSONException`) | `DataException` | Non-retriable; nothing of the batch is written |
+  | Record value that cannot be parsed (`JSONException`) | `DataException` | Non-retriable; the records before it are applied, then the task fails |
 
 - **Connection lifecycle.** A failed batch drops and rebuilds the Redis connection on
   the next `put()`; a transient outage at startup is tolerated and retried lazily.

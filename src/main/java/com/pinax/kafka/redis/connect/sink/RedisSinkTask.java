@@ -6,22 +6,16 @@ import java.text.NumberFormat;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.HashSet;
 
 import org.apache.hc.client5.http.classic.methods.HttpPost;
-import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.config.AbstractConfig;
-import org.apache.kafka.common.metrics.PluginMetrics;
-import org.apache.kafka.common.metrics.Sensor;
-import org.apache.kafka.common.metrics.stats.CumulativeSum;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.errors.DataException;
@@ -50,7 +44,6 @@ public class RedisSinkTask extends SinkTask {
 
     private MailSender mailSender = null;
 
-    private List<String> redisHosts;
     private String redisMaster;
     private String offsetsKey;
     private long retryBackoffMs;
@@ -71,16 +64,6 @@ public class RedisSinkTask extends SinkTask {
     // Where each of those seeks went, until the partition delivers its next record,
     // see checkSoughtOffsets().
     private final Map<TopicPartition, Long> soughtOffsets = new HashMap<TopicPartition, Long>();
-
-    // Sensors are registered by name for the whole worker; this keeps the ones of
-    // two tasks (two connectors, or a task and its replacement) apart.
-    private static final AtomicInteger SENSOR_IDS = new AtomicInteger();
-
-    static final String REJECTED_COMMANDS_METRIC = "rejected-commands-total";
-
-    // Counts the commands of committed batches that Redis rejected. Null when the
-    // Connect worker does not offer plugin metrics.
-    private Sensor rejectedCommands = null;
 
     private void createRedisConnection() {
         // Let connection failures propagate. Callers decide how to react: startup
@@ -120,7 +103,7 @@ public class RedisSinkTask extends SinkTask {
         AbstractConfig config = new AbstractConfig(RedisSinkConfig.CONFIG_DEF, properties);
 
         // Prepare Redis connection
-        redisHosts = config.getList(RedisSinkConfig.HOSTS);
+        List<String> redisHosts = config.getList(RedisSinkConfig.HOSTS);
         redisMaster = config.getString(RedisSinkConfig.MASTER);
         offsetsKey = config.getString(RedisSinkConfig.OFFSETS_KEY);
         retryBackoffMs = config.getLong(RedisSinkConfig.RETRY_BACKOFF_MS);
@@ -141,8 +124,6 @@ public class RedisSinkTask extends SinkTask {
             sentinels.add(redisHostPort);
         }
 
-        registerMetrics();
-
         try {
             createRedisConnection();
         } catch (JedisAccessControlException e) {
@@ -157,34 +138,6 @@ public class RedisSinkTask extends SinkTask {
             logger.warn("Could not connect to Redis on startup, will retry on first put", e);
             closeRedisConnection();
         }
-    }
-
-    private void registerMetrics() {
-        rejectedCommands = null;
-        try {
-            PluginMetrics metrics = context.pluginMetrics();
-            if (metrics == null) {
-                return;
-            }
-            rejectedCommands = counter(metrics, "rejected-commands-" + SENSOR_IDS.incrementAndGet(),
-                    REJECTED_COMMANDS_METRIC,
-                    "Commands of committed batches that Redis rejected (wrong key type, value not a number, "
-                            + "invalid expiration). The record's increment or expiration was not applied.");
-        } catch (NoSuchMethodError | NoClassDefFoundError e) {
-            // Plugin metrics came with Kafka Connect 4.1.
-            logger.warn("This Connect worker has no plugin metrics, {} is only logged", REJECTED_COMMANDS_METRIC);
-        } catch (RuntimeException e) {
-            // For one, the metric of a replaced task that is still shutting down:
-            // "a metric named ... already exists". Not worth failing the task over.
-            logger.warn("Could not register the metric {}, it is only logged", REJECTED_COMMANDS_METRIC, e);
-        }
-    }
-
-    private static Sensor counter(PluginMetrics metrics, String sensorName, String metricName, String description) {
-        MetricName name = metrics.metricName(metricName, description, new LinkedHashMap<String, String>());
-        Sensor sensor = metrics.addSensor(sensorName);
-        sensor.add(name, new CumulativeSum());
-        return sensor;
     }
 
     @Override
@@ -207,11 +160,13 @@ public class RedisSinkTask extends SinkTask {
         // Connect calls put() after every poll, also without records. That is what
         // moves a partition to its stored offset when nothing new arrives on it.
         if (records.isEmpty() && unseekedPartitions.isEmpty()) {
+            // The batch that was being retried is gone (its partitions were revoked).
             seekingPartitions.clear();
+            retries = 0;
             return;
         }
 
-        List<HttpPost> mailRequests = writeToRedis(records);
+        BatchResult result = writeToRedis(records);
         retries = 0;
 
         // Connect carries out the requested seeks before it polls again. Only a
@@ -223,10 +178,17 @@ public class RedisSinkTask extends SinkTask {
         // if the task stops before or while sending, or a send fails, the batch is
         // skipped as already applied when it is delivered again and these mails are
         // not sent. Accepted: the team is notified again at the next milestone.
-        sendMails(mailRequests);
+        sendMails(result.mailRequests);
+
+        // What could be applied is, and its notifications are sent. Now fail the task
+        // over the record that could not: a value that cannot be parsed, or a command
+        // Redis rejected.
+        if (result.failure != null) {
+            throw result.failure;
+        }
     }
 
-    private List<HttpPost> writeToRedis(Collection<SinkRecord> records) {
+    private BatchResult writeToRedis(Collection<SinkRecord> records) {
 
         logger.debug("Received {} records from Connect", records.size());
 
@@ -267,24 +229,39 @@ public class RedisSinkTask extends SinkTask {
                 unseekedPartitions.addAll(context.assignment());
             }
 
+            // Where the batch in hand starts and ends, per partition.
+            Map<TopicPartition, Long> firstInHand = new HashMap<TopicPartition, Long>();
+            Map<TopicPartition, Long> lastInHand = new HashMap<TopicPartition, Long>();
+            for (PendingWrite write : pendingWrites) {
+                firstInHand.merge(write.partition, write.offset, Math::min);
+                lastInHand.merge(write.partition, write.offset, Math::max);
+            }
+
             // One read serves both: where to move newly assigned partitions to, and
             // which records of the batch are applied already.
             boolean watching = !pendingWrites.isEmpty();
             Map<TopicPartition, Long> storedOffsets = readStoredOffsets(pendingWrites, watching);
-            seekToStoredOffsets(pendingWrites, storedOffsets);
-            checkSoughtOffsets(pendingWrites);
+            seekToStoredOffsets(firstInHand, lastInHand, storedOffsets);
+            checkSoughtOffsets(firstInHand);
             pendingWrites = notYetApplied(pendingWrites, storedOffsets);
 
-            // Only what is left is parsed, before anything is written: a malformed
-            // payload fails the batch as a whole, but not once the stored offset has
-            // been moved past it by hand.
-            parse(pendingWrites);
+            // Only what is left is parsed: a record at or below the stored offset is
+            // not, which is what gets the task past one that cannot be parsed once
+            // the stored offset was moved to it by hand. Of a partition with such a
+            // record, the records before it are still applied, so that the stored
+            // offset ends up right before it and moving it skips nothing else.
+            List<PendingWrite> parsed = new ArrayList<PendingWrite>();
+            DataException failure = parse(pendingWrites, parsed);
+            pendingWrites = parsed;
 
             if (pendingWrites.isEmpty()) {
+                if (failure != null) {
+                    throw failure;
+                }
                 if (watching) {
                     jedis.unwatch();
                 }
-                return new ArrayList<HttpPost>();
+                return new BatchResult(new ArrayList<HttpPost>(), null);
             }
 
             Map<TopicPartition, Long> appliedOffsets = new HashMap<TopicPartition, Long>();
@@ -321,23 +298,31 @@ public class RedisSinkTask extends SinkTask {
             }
             // A rejected increment or expiration concerns one record only (its key
             // holds another type or no number, its expiration is out of range). The
-            // rest of the batch is applied and nothing can be retried, so it is
-            // reported and the task carries on.
+            // rest of the batch is applied and nothing can be retried. The task fails
+            // over it once the notifications of the other records are sent; after a
+            // restart it continues behind the batch.
+            int rejected = 0;
             for (PendingWrite write : pendingWrites) {
                 try {
                     write.newBilledCredits = write.response.get();
                 } catch (JedisDataException e) {
                     write.incrementRejected = true;
-                    reportRejected("INCRBYFLOAT", write, e);
+                    rejected++;
+                    logRejected("INCRBYFLOAT", write, e);
                 }
                 try {
                     write.expireResponse.get();
                 } catch (JedisDataException e) {
-                    reportRejected("EXPIREAT", write, e);
+                    rejected++;
+                    logRejected("EXPIREAT", write, e);
                 }
             }
+            if (rejected > 0 && failure == null) {
+                failure = new DataException("Redis rejected " + rejected + " commands of a batch that is "
+                        + "otherwise applied and will not be delivered again, see the log for the records");
+            }
 
-            return prepareMailRequests(pendingWrites);
+            return new BatchResult(prepareMailRequests(pendingWrites), failure);
         } catch (RetriableException e) {
             // The refused transaction above; the connection is still good.
             throw e;
@@ -397,23 +382,38 @@ public class RedisSinkTask extends SinkTask {
         return new RetriableException(message, cause);
     }
 
-    private void parse(List<PendingWrite> pendingWrites) {
+    /**
+     * Parses the records into {@code parsed} and returns the failure of the first one
+     * that cannot be parsed, or null. Of a partition with such a record, only the
+     * records before it are parsed.
+     */
+    private DataException parse(List<PendingWrite> pendingWrites, List<PendingWrite> parsed) {
+        DataException failure = null;
+        Set<TopicPartition> failedPartitions = new HashSet<TopicPartition>();
+
         for (PendingWrite write : pendingWrites) {
+            if (failedPartitions.contains(write.partition)) {
+                continue;
+            }
             try {
                 write.parse();
+                parsed.add(write);
             } catch (JSONException e) {
                 // Only JSON/field-shape problems are "bad data" — surface as a
                 // non-retriable DataException. Anything unexpected propagates with
                 // its real type rather than being mislabelled a parsing error.
-                // Nothing of the batch is written and the stored offset stays before
-                // it, so the task fails on this record again until the offset is
-                // moved past it by hand (see the README).
+                // The stored offset stays before this record, so the task fails on
+                // it again until the offset is moved to it by hand (see the README).
                 logger.error("Data or parsing error for record {} offset {}: {}", write.partition, write.offset,
                         write.record, e);
-                throw new DataException("Data or parsing error for record " + write.partition + " offset "
-                        + write.offset, e);
+                failedPartitions.add(write.partition);
+                if (failure == null) {
+                    failure = new DataException("Data or parsing error for record " + write.partition
+                            + " offset " + write.offset, e);
+                }
             }
         }
+        return failure;
     }
 
     /**
@@ -423,15 +423,7 @@ public class RedisSinkTask extends SinkTask {
      * topic or another cluster. Carrying on would skip every record up to that offset
      * as already applied.
      */
-    private void checkSoughtOffsets(List<PendingWrite> pendingWrites) {
-        if (soughtOffsets.isEmpty()) {
-            return;
-        }
-        Map<TopicPartition, Long> firstInHand = new HashMap<TopicPartition, Long>();
-        for (PendingWrite write : pendingWrites) {
-            firstInHand.merge(write.partition, write.offset, Math::min);
-        }
-
+    private void checkSoughtOffsets(Map<TopicPartition, Long> firstInHand) {
         for (Map.Entry<TopicPartition, Long> first : firstInHand.entrySet()) {
             TopicPartition partition = first.getKey();
             // Still the batch read before the seek was carried out.
@@ -450,12 +442,9 @@ public class RedisSinkTask extends SinkTask {
         }
     }
 
-    private void reportRejected(String command, PendingWrite write, JedisDataException e) {
+    private void logRejected(String command, PendingWrite write, JedisDataException e) {
         logger.error("Redis rejected {} for key {} (record {} offset {}), the rest of the batch is applied: {}",
                 command, write.key, write.partition, write.offset, e.getMessage());
-        if (rejectedCommands != null) {
-            rejectedCommands.record();
-        }
     }
 
     private void sendMails(List<HttpPost> mailRequests) {
@@ -542,18 +531,10 @@ public class RedisSinkTask extends SinkTask {
      * <p>A partition without a stored offset (first start with this version, or an
      * empty Redis) stays where the consumer group has it.
      */
-    private void seekToStoredOffsets(List<PendingWrite> pendingWrites, Map<TopicPartition, Long> storedOffsets) {
+    private void seekToStoredOffsets(Map<TopicPartition, Long> firstInHand, Map<TopicPartition, Long> lastInHand,
+            Map<TopicPartition, Long> storedOffsets) {
         if (unseekedPartitions.isEmpty()) {
             return;
-        }
-
-        // Where the batch in hand starts and ends, to tell whether a partition has to
-        // be moved at all, and how far back.
-        Map<TopicPartition, Long> firstInHand = new HashMap<TopicPartition, Long>();
-        Map<TopicPartition, Long> lastInHand = new HashMap<TopicPartition, Long>();
-        for (PendingWrite write : pendingWrites) {
-            firstInHand.merge(write.partition, write.offset, Math::min);
-            lastInHand.merge(write.partition, write.offset, Math::max);
         }
 
         // The offsets were read before this is called: a failure to read them leaves
@@ -709,6 +690,17 @@ public class RedisSinkTask extends SinkTask {
     @Override
     public String version() {
         return RedisSinkConnector.VERSION;
+    }
+
+    /** What a batch came to: the notifications to send, and what to fail the task with after that. */
+    private static final class BatchResult {
+        final List<HttpPost> mailRequests;
+        final DataException failure;
+
+        BatchResult(List<HttpPost> mailRequests, DataException failure) {
+            this.mailRequests = mailRequests;
+            this.failure = failure;
+        }
     }
 
     /**
