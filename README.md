@@ -136,14 +136,18 @@ multiples of the allowance. If a single batch leaps past several at once, only t
   batch is written, records at or below the stored offset are dropped: a batch that
   Connect delivers again after a failure, a restart or a rewind of the consumer group
   is not counted twice, and its notifications are not sent twice.
-- **Redis decides where a partition continues.** On the first batch after a partition
-  is assigned, the task compares it with the stored offset. If the batch starts beyond
-  the record that follows it, the task rewinds the consumer to that record. Offsets
-  have gaps (transaction markers), so this also happens once per assignment without
-  anything being missing; the records then simply arrive again.
+- **Redis decides where a partition continues.** When a partition is assigned, the
+  task moves the consumer to the record after the stored offset, whatever the consumer
+  group has committed. It does so on the next `put()`, which Connect also calls without
+  records, so a partition nothing is produced to is covered too. Records of that
+  partition already in hand are left out and arrive again from the new position. A
+  partition without a stored offset stays where the consumer group has it.
+- **Transformations.** Offsets are stored and compared by the topic, partition and
+  offset a record was read from, so a transformation that renames the topic does not
+  affect them. The hash is named after the source topic.
 - **Restoring Redis.** Because counters and offsets are written together, a snapshot
   (RDB or AOF) is consistent by itself. Stop the connector, restore the snapshot, start
-  the connector: it rewinds to the offsets in the snapshot and re-applies what came
+  the connector: it continues at the offsets in the snapshot and re-applies what came
   after it. Things to know:
   - The topic must still hold those records. If retention has removed them, the
     consumer continues at the earliest record left and the removed ones stay uncounted.

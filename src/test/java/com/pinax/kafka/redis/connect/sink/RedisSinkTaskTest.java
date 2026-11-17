@@ -304,19 +304,20 @@ class RedisSinkTaskTest {
     }
 
     @Test
-    void put_firstBatchBeyondStoredOffset_rewindsAndLeavesThePartitionOut() {
+    void assignedPartition_isMovedToTheStoredOffsetAndLeftOutOfTheBatch() {
         // Redis was restored from a snapshot: its counters and offsets are older than
         // what the consumer group has committed.
         withConnectedRedis(mailSender -> {
             stubIncrByFloat(1.0);
             storedOffset(5L);
 
+            task.open(List.of(PARTITION));
             task.put(List.of(record("team:1", CREDITS_JSON, 9L)));
 
             verify(context).offset(PARTITION, 6L);
             verify(jedis, never()).multi();
 
-            // Connect delivers the partition again from the rewound position.
+            // Connect delivers the partition again from the new position.
             task.put(List.of(record("team:1", CREDITS_JSON, 7L), record("team:1", CREDITS_JSON, 9L)));
 
             verify(context, times(1)).offset(any(TopicPartition.class), anyLong());
@@ -326,24 +327,30 @@ class RedisSinkTaskTest {
     }
 
     @Test
-    void put_firstBatchFollowsStoredOffset_doesNotRewind() {
+    void assignedPartition_withoutRecords_isMovedToTheStoredOffset() {
+        // The consumer group is at the end of the partition and nothing is produced
+        // to it: no record will ever arrive to trigger the replay.
         withConnectedRedis(mailSender -> {
-            stubIncrByFloat(1.0);
             storedOffset(5L);
 
-            task.put(List.of(record("team:1", CREDITS_JSON, 6L)));
+            task.open(List.of(PARTITION));
+            task.put(Collections.emptyList());
 
-            verify(context, never()).offset(any(TopicPartition.class), anyLong());
-            verify(transaction).hset(OFFSETS_KEY, "0", "6");
+            verify(context).offset(PARTITION, 6L);
+            verify(jedis, never()).multi();
+
+            task.put(Collections.emptyList());
+            verify(context, times(1)).offset(any(TopicPartition.class), anyLong());
         });
     }
 
     @Test
-    void put_noStoredOffset_doesNotRewind() {
-        // First start with this version, or an empty Redis: the consumer group decides.
+    void assignedPartition_withoutStoredOffset_staysWhereTheConsumerGroupHasIt() {
+        // First start with this version, or an empty Redis.
         withConnectedRedis(mailSender -> {
             stubIncrByFloat(1.0);
 
+            task.open(List.of(PARTITION));
             task.put(List.of(record("team:1", CREDITS_JSON, 42L)));
 
             verify(context, never()).offset(any(TopicPartition.class), anyLong());
@@ -352,20 +359,87 @@ class RedisSinkTaskTest {
     }
 
     @Test
-    void open_checksTheStoredOffsetAgainForReassignedPartitions() {
+    void assignedPartition_staysLeftOutWhenTheBatchIsRetried() {
+        // Partition 0 is moved back, partition 1 is written and that fails. Connect
+        // delivers the same batch again: applying partition 0's records now would
+        // store an offset beyond the records still to be replayed.
         withConnectedRedis(mailSender -> {
             stubIncrByFloat(1.0);
             storedOffset(5L);
+            when(transaction.exec()).thenReturn(null).thenReturn(List.of());
 
-            task.put(List.of(record("team:1", CREDITS_JSON, 6L)));
-            // A gap that is not checked: only the first batch after an assignment is.
-            task.put(List.of(record("team:1", CREDITS_JSON, 9L)));
-            verify(context, never()).offset(any(TopicPartition.class), anyLong());
+            List<SinkRecord> batch = List.of(record("team:1", CREDITS_JSON, 9L),
+                    new SinkRecord("usage", 1, null, "team:2", null, CREDITS_JSON, 3L));
+
+            task.open(List.of(PARTITION, new TopicPartition("usage", 1)));
+            assertThrows(RetriableException.class, () -> task.put(batch));
+            task.put(batch);
+
+            verify(transaction, never()).incrByFloat(eq("team:1"), anyDouble());
+            verify(transaction, never()).hset(OFFSETS_KEY, "0", "9");
+            verify(transaction, times(2)).hset(OFFSETS_KEY, "1", "3");
+
+            // After the seek, the partition is delivered from the stored offset.
+            task.put(List.of(record("team:1", CREDITS_JSON, 7L), record("team:1", CREDITS_JSON, 9L)));
+            verify(transaction, times(2)).incrByFloat("team:1", 1.0);
+            verify(transaction).hset(OFFSETS_KEY, "0", "9");
+        });
+    }
+
+    @Test
+    void assignedPartition_redisUnavailable_isMovedOnTheRetry() {
+        withConnectedRedis(mailSender -> {
+            Map<String, String> offsets = new HashMap<>();
+            offsets.put("0", "5");
+            when(jedis.hgetAll(OFFSETS_KEY)).thenThrow(new JedisConnectionException("down")).thenReturn(offsets);
 
             task.open(List.of(PARTITION));
-            task.put(List.of(record("team:1", CREDITS_JSON, 12L)));
+            assertThrows(RetriableException.class, () -> task.put(Collections.emptyList()));
+            verify(context, never()).offset(any(TopicPartition.class), anyLong());
 
+            task.put(Collections.emptyList());
             verify(context).offset(PARTITION, 6L);
+        });
+    }
+
+    @Test
+    void open_movesAReassignedPartitionAgain() {
+        withConnectedRedis(mailSender -> {
+            storedOffset(5L);
+
+            task.open(List.of(PARTITION));
+            task.put(Collections.emptyList());
+            task.close(List.of(PARTITION));
+            task.open(List.of(PARTITION));
+            task.put(Collections.emptyList());
+
+            verify(context, times(2)).offset(PARTITION, 6L);
+        });
+    }
+
+    @Test
+    void put_usesTheCoordinatesTheRecordWasReadFrom() {
+        // A transformation renamed the topic; the offset belongs to the source topic.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            SinkRecord read = record("team:1", CREDITS_JSON, 7L);
+            SinkRecord routed = read.newRecord("renamed", 3, null, "team:1", null, CREDITS_JSON, null);
+
+            task.put(List.of(routed));
+
+            verify(jedis).watch(OFFSETS_KEY);
+            verify(transaction).hset(OFFSETS_KEY, "0", "7");
+        });
+    }
+
+    @Test
+    void put_offsetsNotStored_throwsDataException() {
+        // EXEC returns a rejected command as an exception among its results.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            when(transaction.exec()).thenReturn(List.of(1.0, 1L, new JedisDataException("WRONGTYPE")));
+
+            assertThrows(DataException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON))));
         });
     }
 

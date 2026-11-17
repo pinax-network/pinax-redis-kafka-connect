@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.time.Instant;
+import java.util.List;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -117,11 +118,14 @@ class RedisSinkIT {
         Transaction transaction = jedis.multi();
         Response<Double> bad = transaction.incrByFloat(key, 1.0);
         transaction.hset(offsetsKey, "0", "3");
-        transaction.exec();
+        List<Object> results = transaction.exec();
 
-        // Crucially: the error surfaces at get(), NOT at exec(). This is the exact
-        // assumption RedisSinkTask.prepareMailRequests relies on by reading get()
-        // outside its JSONException catch.
+        // EXEC succeeds and returns the rejected command as an exception among its
+        // results, which RedisSinkTask checks for every command of the batch.
+        assertTrue(results.get(0) instanceof JedisDataException);
+        assertFalse(results.get(1) instanceof JedisDataException);
+
+        // The same error surfaces at get().
         assertThrows(JedisDataException.class, bad::get);
         // Redis does not roll back: the offsets of the batch are stored regardless.
         assertEquals("3", jedis.hget(offsetsKey, "0"));
