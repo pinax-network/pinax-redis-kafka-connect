@@ -258,7 +258,7 @@ public class RedisSinkTask extends SinkTask {
                 unseekedPartitions.addAll(context.assignment());
             }
 
-            seekToStoredOffsets();
+            seekToStoredOffsets(pendingWrites);
 
             Map<TopicPartition, Long> storedOffsets = watchStoredOffsets(pendingWrites);
             pendingWrites = notYetApplied(pendingWrites, storedOffsets);
@@ -479,9 +479,15 @@ public class RedisSinkTask extends SinkTask {
      * <p>A partition without a stored offset (first start with this version, or an
      * empty Redis) stays where the consumer group has it.
      */
-    private void seekToStoredOffsets() {
+    private void seekToStoredOffsets(List<PendingWrite> pendingWrites) {
         if (unseekedPartitions.isEmpty()) {
             return;
+        }
+
+        // Where the batch in hand starts, to tell how far back a partition is moved.
+        Map<TopicPartition, Long> firstInHand = new HashMap<TopicPartition, Long>();
+        for (PendingWrite write : pendingWrites) {
+            firstInHand.merge(write.partition, write.offset, Math::min);
         }
 
         Set<String> topics = new HashSet<String>();
@@ -497,8 +503,19 @@ public class RedisSinkTask extends SinkTask {
         for (TopicPartition partition : unseekedPartitions) {
             Long storedOffset = storedOffsets.get(partition);
             if (storedOffset != null) {
-                logger.info("Continuing {} at offset {}, the record after the last one applied to Redis",
-                        partition, storedOffset + 1);
+                Long first = firstInHand.get(partition);
+                if (first != null && first > storedOffset + 1) {
+                    // Expected after Redis was restored or lost writes in a failover.
+                    // Otherwise the offsets in Redis are stale (written by this
+                    // version, then left behind by an older one) and these records
+                    // are counted a second time.
+                    logger.warn("Moving {} back to offset {}, the record after the last one applied to Redis: "
+                            + "{} records the consumer group had already passed are applied again",
+                            partition, storedOffset + 1, first - storedOffset - 1);
+                } else {
+                    logger.info("Continuing {} at offset {}, the record after the last one applied to Redis",
+                            partition, storedOffset + 1);
+                }
                 context.offset(partition, storedOffset + 1);
                 seekingPartitions.add(partition);
             }

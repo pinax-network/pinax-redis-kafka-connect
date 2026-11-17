@@ -163,6 +163,12 @@ multiples of the allowance. If a single batch leaps past several at once, only t
   - A Redis without the offset hash (empty, or last written by a version before 0.4.0)
     follows the consumer group as before. To rebuild the counters from the topic, delete
     them and reset the consumer group's offsets.
+  - **Rolling back.** A version before 0.4.0 counts records without updating the offset
+    hash. After running one, delete `<offsetsKey>:<topic>` before starting 0.4.0 or later
+    again. Otherwise the task goes back to the stale offsets and everything the old
+    version counted is counted a second time. The task cannot tell this from a restored
+    snapshot; it logs a warning with the number of records whenever it moves a partition
+    back behind the batch in hand.
   - The offsets belong to one Kafka cluster. When the connector is pointed at another
     cluster or a re-created topic, delete `<offsetsKey>:<topic>` first, or the stored
     offsets are applied to the new topic.
