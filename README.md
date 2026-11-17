@@ -163,6 +163,11 @@ multiples of the allowance. If a single batch leaps past several at once, only t
   - A Redis without the offset hash (empty, or last written by a version before 0.4.0)
     follows the consumer group as before. To rebuild the counters from the topic, delete
     them and reset the consumer group's offsets.
+  - A partition gets its entry in the hash with the first record applied by 0.4.0 or
+    later. A snapshot taken before that restores the partition to wherever the consumer
+    group is, and its records since the snapshot are not applied again. Check with
+    `HGETALL <offsetsKey>:<topic>` that every partition is listed; the task warns when
+    it is assigned a partition that is missing from an existing hash.
   - **Rolling back.** A version before 0.4.0 counts records without updating the offset
     hash. After running one, delete `<offsetsKey>:<topic>` before starting 0.4.0 or later
     again. Otherwise the task goes back to the stale offsets and everything the old

@@ -500,6 +500,11 @@ public class RedisSinkTask extends SinkTask {
             readStoredOffsets(topic, storedOffsets);
         }
 
+        Set<String> topicsWithOffsets = new HashSet<String>();
+        for (TopicPartition stored : storedOffsets.keySet()) {
+            topicsWithOffsets.add(stored.topic());
+        }
+
         for (TopicPartition partition : unseekedPartitions) {
             Long storedOffset = storedOffsets.get(partition);
             if (storedOffset != null) {
@@ -518,6 +523,12 @@ public class RedisSinkTask extends SinkTask {
                 }
                 context.offset(partition, storedOffset + 1);
                 seekingPartitions.add(partition);
+            } else if (topicsWithOffsets.contains(partition.topic())) {
+                // Gets its entry with the first record applied. A snapshot taken
+                // before that restores this partition to wherever the consumer group
+                // is, not to the time of the snapshot.
+                logger.warn("No offset stored in Redis for {} yet although other partitions of the topic have "
+                        + "one: it follows the consumer group until its first record is applied", partition);
             }
         }
         unseekedPartitions.clear();
