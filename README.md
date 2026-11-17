@@ -69,8 +69,8 @@ and restart the worker.
 | `templateSlug`    | **yes**  | —                    | Mandrill template name used to render the usage email.          |
 
 Plus the standard Kafka Connect sink properties (`topics`, converters, `errors.*`, …).
-`tasks.max` must be `1`: the connector fails to start with a higher value, see
-"A single task" below.
+`tasks.max` must be `1`: a config with a higher value is rejected, see "A single task"
+below.
 
 ### Example connector configuration
 
@@ -182,8 +182,9 @@ multiples of the allowance. If a single batch leaps past several at once, only t
     offsets are applied to the new topic.
 - **A single task.** The offsets of all partitions of a topic are in one hash, and every
   transaction `WATCH`es it, so tasks running side by side would refuse each other's
-  transactions. The connector therefore always creates one task and fails to start when
-  `tasks.max` is higher than 1. The `WATCH` remains for a task that was replaced but has
+  transactions. The connector therefore always creates one task. A config with
+  `tasks.max` higher than 1 is rejected when it is submitted; one stored before that is
+  brought down to one task, with a warning in the log. The `WATCH` remains for a task that was replaced but has
   not noticed yet: when it stored offsets in between, the transaction is refused,
   nothing is applied and the batch is retried after `conflictRetryBackoffMs`.
 - **Retries.** A batch that failed for a passing reason is delivered again by Connect
@@ -203,7 +204,9 @@ multiples of the allowance. If a single batch leaps past several at once, only t
   key, topic, partition and offset, counted in the `invalid-records-total` metric, and
   the stored offset moves past it with the rest of its batch. When the connector has a
   dead letter queue (`errors.tolerance=all`, `errors.deadletterqueue.topic.name`), the
-  record is sent there.
+  record is sent there before the offset moves, so a batch that is retried sends it
+  again. A record the queue does not take (also with `errors.tolerance=none`, where
+  Connect refuses it) is logged and skipped all the same.
 - **Metrics.** `rejected-commands-total` and `invalid-records-total` count the two
   cases above. They are Connect plugin metrics (JMX:
   `kafka.connect:type=plugins,connector=…,task=…`) and need a Kafka Connect 4.1+ worker;

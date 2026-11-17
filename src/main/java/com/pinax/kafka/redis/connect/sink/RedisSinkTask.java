@@ -12,6 +12,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.HashSet;
 
 import org.apache.hc.client5.http.classic.methods.HttpPost;
@@ -70,6 +72,9 @@ public class RedisSinkTask extends SinkTask {
     private static final String[] TRANSIENT_ERRORS = {
         "LOADING", "BUSY", "READONLY", "MISCONF", "OOM", "MASTERDOWN", "NOREPLICAS", "TRYAGAIN", "CLUSTERDOWN" };
     private static final String EXECABORT_CAUSE = "EXECABORT Transaction discarded because of: ";
+
+    // How long to wait for a skipped record to reach the dead letter queue.
+    private static final long DEAD_LETTER_TIMEOUT_MS = 10000L;
 
     static final String REJECTED_COMMANDS_METRIC = "rejected-commands-total";
     static final String INVALID_RECORDS_METRIC = "invalid-records-total";
@@ -300,6 +305,15 @@ public class RedisSinkTask extends SinkTask {
                 return new ArrayList<HttpPost>();
             }
 
+            // Before the transaction moves the stored offset past them: once it has,
+            // they are never delivered again. A batch that is retried sends them a
+            // second time.
+            for (PendingWrite write : pendingWrites) {
+                if (write.isInvalid()) {
+                    sendToDeadLetterQueue(write);
+                }
+            }
+
             Map<TopicPartition, Long> appliedOffsets = new HashMap<TopicPartition, Long>();
             List<Response<Long>> offsetResponses = new ArrayList<Response<Long>>();
             Transaction transaction = jedis.multi();
@@ -342,8 +356,8 @@ public class RedisSinkTask extends SinkTask {
             // reported and the task carries on.
             for (PendingWrite write : pendingWrites) {
                 if (write.isInvalid()) {
-                    // Reported only now that the offset behind it is stored, so a
-                    // batch that is retried does not report it again.
+                    // Logged and counted only now that the offset behind it is
+                    // stored, so a batch that is retried does not count it again.
                     reportInvalid(write);
                     continue;
                 }
@@ -363,6 +377,12 @@ public class RedisSinkTask extends SinkTask {
             return prepareMailRequests(pendingWrites);
         } catch (RetriableException e) {
             // The refused transaction above; the connection is still good.
+            throw e;
+        } catch (ConnectException e) {
+            // Raised above on purpose (offsets not stored, invalid stored offset):
+            // keep its type and message, they say whether the batch was applied.
+            logger.error("Cannot continue after this batch", e);
+            closeRedisConnection();
             throw e;
         } catch (JedisAccessControlException e) {
             // Auth/ACL errors are permanent — retrying cannot fix them, so fail the
@@ -414,9 +434,31 @@ public class RedisSinkTask extends SinkTask {
         if (invalidRecords != null) {
             invalidRecords.record();
         }
-        if (errantRecordReporter != null) {
-            // To the dead letter queue. Connect waits for it before it commits.
-            errantRecordReporter.report(write.record, write.parseError);
+    }
+
+    /**
+     * Hands a record that cannot be parsed to Connect's dead letter queue, if the
+     * connector has one, and waits for it to be written. Never fails the batch: the
+     * reporter throws when errors.tolerance is none, and a record that cannot reach
+     * the queue must not hold up the partition any more than one that cannot be
+     * parsed.
+     */
+    private void sendToDeadLetterQueue(PendingWrite write) {
+        if (errantRecordReporter == null) {
+            return;
+        }
+        try {
+            Future<Void> sent = errantRecordReporter.report(write.record, write.parseError);
+            if (sent != null) {
+                sent.get(DEAD_LETTER_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            logger.error("Interrupted while sending record {} offset {} to the dead letter queue",
+                    write.partition, write.offset, e);
+        } catch (Exception e) {
+            logger.error("Could not send record {} offset {} to the dead letter queue, skipping it anyway",
+                    write.partition, write.offset, e);
         }
     }
 

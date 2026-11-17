@@ -38,14 +38,15 @@ public class RedisSinkConfig {
                         .define(RETRY_BACKOFF_MS,
                                         ConfigDef.Type.LONG,
                                         5000L,
-                                        ConfigDef.Range.atLeast(0L),
+                                        // Connect ignores a timeout of 0.
+                                        ConfigDef.Range.atLeast(1L),
                                         ConfigDef.Importance.LOW,
                                         "Time in milliseconds before a batch is retried after Redis was "
                                                         + "unreachable or not accepting writes")
                         .define(CONFLICT_RETRY_BACKOFF_MS,
                                         ConfigDef.Type.LONG,
                                         1000L,
-                                        ConfigDef.Range.atLeast(0L),
+                                        ConfigDef.Range.atLeast(1L),
                                         ConfigDef.Importance.LOW,
                                         "Time in milliseconds before a batch is retried after Redis refused "
                                                         + "its transaction because the stored offsets were "

@@ -170,8 +170,9 @@ class RedisSinkTaskTest {
     }
 
     @Test
-    void put_malformedJson_isReportedOnceTheBatchIsCommitted() {
-        // Not on the attempt that failed: the retry would report it a second time.
+    void put_malformedJson_isSentToTheDeadLetterQueueBeforeTheOffsetMoves() {
+        // Sent on every attempt, so it cannot be lost when the commit is; counted
+        // only once the batch is committed.
         ErrantRecordReporter reporter = mock(ErrantRecordReporter.class);
         when(context.errantRecordReporter()).thenReturn(reporter);
         withConnectedRedis(mailSender -> {
@@ -180,11 +181,31 @@ class RedisSinkTaskTest {
             SinkRecord malformed = record("team:1", "this is not json", 8L);
 
             assertThrows(RetriableException.class, () -> task.put(List.of(malformed)));
-            verify(reporter, never()).report(any(SinkRecord.class), any(Throwable.class));
+            verify(reporter, times(1)).report(eq(malformed), any(Throwable.class));
+            verify(invalidRecords, never()).record();
 
             task.put(List.of(malformed));
-            verify(reporter, times(1)).report(eq(malformed), any(Throwable.class));
+            verify(reporter, times(2)).report(eq(malformed), any(Throwable.class));
             verify(invalidRecords, times(1)).record();
+        });
+    }
+
+    @Test
+    void put_deadLetterQueueRefusesTheRecord_theBatchIsStillApplied() {
+        // With errors.tolerance=none the reporter throws.
+        ErrantRecordReporter reporter = mock(ErrantRecordReporter.class);
+        when(context.errantRecordReporter()).thenReturn(reporter);
+        when(reporter.report(any(SinkRecord.class), any(Throwable.class)))
+                .thenThrow(new ConnectException("Tolerance exceeded in error handler"));
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+
+            assertDoesNotThrow(() -> task.put(List.of(
+                    record("team:1", CREDITS_JSON, 7L), record("team:2", "this is not json", 8L))));
+
+            verify(transaction, times(1)).incrByFloat(anyString(), anyDouble());
+            verify(transaction).hset(OFFSETS_KEY, "0", "8");
+            verify(invalidRecords).record();
         });
     }
 
