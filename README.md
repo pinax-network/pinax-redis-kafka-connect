@@ -62,12 +62,15 @@ and restart the worker.
 | `master`          | no       | `mymaster`           | Redis Sentinel master name.                                     |
 | `hosts`           | no       | `localhost:6379`     | Comma-separated list of Sentinel `host:port` addresses.         |
 | `offsetsKey`      | no       | `kafka-connect:redis-sink:offsets` | Prefix of the hashes holding the applied offsets, one per topic (`<offsetsKey>:<topic>`). |
+| `retryBackoffMs`  | no       | `5000`               | Milliseconds before a batch is retried after Redis was unreachable or not accepting writes. |
+| `conflictRetryBackoffMs` | no | `1000`              | Milliseconds before a batch is retried after its transaction was refused because the stored offsets changed. |
 | `from`            | no       | `info@pinax.network` | `From` address for notification emails (must be a valid email). |
 | `mailchimpApiKey` | **yes**  | —                    | Mandrill / Mailchimp Transactional API key.                     |
 | `templateSlug`    | **yes**  | —                    | Mandrill template name used to render the usage email.          |
 
-Plus the standard Kafka Connect sink properties (`topics`, `tasks.max`, converters,
-`errors.*`, …).
+Plus the standard Kafka Connect sink properties (`topics`, converters, `errors.*`, …).
+`tasks.max` must be `1`: the connector fails to start with a higher value, see
+"A single task" below.
 
 ### Example connector configuration
 
@@ -177,9 +180,15 @@ multiples of the allowance. If a single batch leaps past several at once, only t
   - The offsets belong to one Kafka cluster. When the connector is pointed at another
     cluster or a re-created topic, delete `<offsetsKey>:<topic>` first, or the stored
     offsets are applied to the new topic.
-- **Two tasks, one partition.** The offset hashes are `WATCH`ed, so a transaction is
-  refused when another task stored offsets in between (a task that lost its partitions
-  in a rebalance but has not noticed yet). Nothing is applied and the batch is retried.
+- **A single task.** The offsets of all partitions of a topic are in one hash, and every
+  transaction `WATCH`es it, so tasks running side by side would refuse each other's
+  transactions. The connector therefore always creates one task and fails to start when
+  `tasks.max` is higher than 1. The `WATCH` remains for a task that was replaced but has
+  not noticed yet: when it stored offsets in between, the transaction is refused,
+  nothing is applied and the batch is retried after `conflictRetryBackoffMs`.
+- **Retries.** A batch that failed for a passing reason is delivered again by Connect
+  after `retryBackoffMs` (Redis unreachable or not accepting writes) or
+  `conflictRetryBackoffMs` (transaction refused).
 - **Not rolled back.** Redis does not undo a transaction when it rejects one of its
   commands: the rest of the batch and the offsets are applied.
   - A rejected increment or expiration (`WRONGTYPE`, "not a valid float", "invalid expire

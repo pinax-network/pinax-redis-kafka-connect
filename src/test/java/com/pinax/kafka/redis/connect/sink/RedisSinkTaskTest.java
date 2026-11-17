@@ -157,6 +157,7 @@ class RedisSinkTaskTest {
             List<SinkRecord> records = List.of(
                     record("team:1", "{\"billed_credits\":1.0,\"expiration\":9999999999}"));
             assertThrows(RetriableException.class, () -> task.put(records));
+            verify(context).timeout(5000L);
         });
     }
 
@@ -191,6 +192,7 @@ class RedisSinkTaskTest {
                     .thenThrow(new JedisDataException("LOADING Redis is loading the dataset in memory"));
 
             assertThrows(RetriableException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON))));
+            verify(context).timeout(5000L);
         });
     }
 
@@ -556,6 +558,7 @@ class RedisSinkTaskTest {
             when(transaction.exec()).thenReturn(null);
 
             assertThrows(RetriableException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON))));
+            verify(context).timeout(1000L);
         });
     }
 

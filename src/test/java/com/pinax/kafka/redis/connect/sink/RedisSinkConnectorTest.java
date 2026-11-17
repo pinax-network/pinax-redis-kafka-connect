@@ -2,11 +2,13 @@ package com.pinax.kafka.redis.connect.sink;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import org.apache.kafka.connect.errors.ConnectException;
 import org.junit.jupiter.api.Test;
 
 class RedisSinkConnectorTest {
@@ -29,18 +31,24 @@ class RedisSinkConnectorTest {
     }
 
     @Test
-    void taskConfigs_replicatesStartConfigForEachTask() {
+    void taskConfigs_isASingleTaskWhateverIsAllowed() {
         Map<String, String> props = new HashMap<>();
         props.put(RedisSinkConfig.MASTER, "mymaster");
         props.put(RedisSinkConfig.MAILCHIMP_API_KEY, "key");
         props.put(RedisSinkConfig.TEMPLATE_SLUG, "slug");
+        props.put("tasks.max", "1");
         connector.start(props);
 
         List<Map<String, String>> taskConfigs = connector.taskConfigs(3);
 
-        assertEquals(3, taskConfigs.size());
-        for (Map<String, String> taskConfig : taskConfigs) {
-            assertEquals(props, taskConfig);
-        }
+        assertEquals(List.of(props), taskConfigs);
+    }
+
+    @Test
+    void start_moreThanOneTask_fails() {
+        Map<String, String> props = new HashMap<>();
+        props.put("tasks.max", "2");
+
+        assertThrows(ConnectException.class, () -> connector.start(props));
     }
 }

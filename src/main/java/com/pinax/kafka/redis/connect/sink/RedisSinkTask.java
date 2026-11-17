@@ -52,6 +52,8 @@ public class RedisSinkTask extends SinkTask {
     private List<String> redisHosts;
     private String redisMaster;
     private String offsetsKey;
+    private long retryBackoffMs;
+    private long conflictRetryBackoffMs;
 
     // Partitions assigned to this task whose consumer has not been moved to the offset
     // stored in Redis yet, see seekToStoredOffsets().
@@ -115,6 +117,8 @@ public class RedisSinkTask extends SinkTask {
         redisHosts = config.getList(RedisSinkConfig.HOSTS);
         redisMaster = config.getString(RedisSinkConfig.MASTER);
         offsetsKey = config.getString(RedisSinkConfig.OFFSETS_KEY);
+        retryBackoffMs = config.getLong(RedisSinkConfig.RETRY_BACKOFF_MS);
+        conflictRetryBackoffMs = config.getLong(RedisSinkConfig.CONFLICT_RETRY_BACKOFF_MS);
         unseekedPartitions.clear();
         seekingPartitions.clear();
 
@@ -247,7 +251,9 @@ public class RedisSinkTask extends SinkTask {
         // between; the batch is then retried against the new offsets.
         //
         // The whole batch shares one try/catch so any Redis failure (connection, pool,
-        // sentinel) maps to a single RetriableException.
+        // sentinel) maps to a single RetriableException. Each sets the time after
+        // which Connect delivers the batch again; without it that is only when its
+        // next poll returns, up to offset.flush.interval.ms later.
         try {
             if (jedis == null) {
                 createRedisConnection();
@@ -286,6 +292,7 @@ public class RedisSinkTask extends SinkTask {
             if (results == null) {
                 // Nothing was applied. Not an error of this batch, so retry it.
                 logger.warn("Offsets in Redis changed while writing the batch, will retry it");
+                context.timeout(conflictRetryBackoffMs);
                 throw new RetriableException("Offsets in Redis changed while writing the batch");
             }
             // The transaction is applied, but Redis does not roll it back when it
@@ -337,6 +344,7 @@ public class RedisSinkTask extends SinkTask {
                 // master.
                 logger.warn("Redis is temporarily not accepting writes, will retry batch", e);
                 closeRedisConnection();
+                context.timeout(retryBackoffMs);
                 throw new RetriableException("Redis is temporarily not accepting writes", e);
             }
             // Server refused a read or the whole transaction for a reason retrying
@@ -351,6 +359,7 @@ public class RedisSinkTask extends SinkTask {
             // sentinel failover — all transient. Drop the connection and retry.
             logger.error("Redis connection error, will retry batch", e);
             closeRedisConnection();
+            context.timeout(retryBackoffMs);
             throw new RetriableException("Redis connection error", e);
         } catch (Exception e) {
             // Unexpected non-retriable failure while writing the batch to Redis.
