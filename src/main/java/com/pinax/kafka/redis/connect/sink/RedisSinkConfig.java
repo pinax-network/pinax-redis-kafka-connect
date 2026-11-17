@@ -42,7 +42,7 @@ public class RedisSinkConfig {
                                         ConfigDef.Range.atLeast(1L),
                                         ConfigDef.Importance.LOW,
                                         "Time in milliseconds before a batch is retried after Redis was "
-                                                        + "unreachable or not accepting writes")
+                                                        + "unreachable")
                         .define(CONFLICT_RETRY_BACKOFF_MS,
                                         ConfigDef.Type.LONG,
                                         1000L,

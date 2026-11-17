@@ -64,13 +64,9 @@ public class RedisSinkTask extends SinkTask {
     // batch in hand was read from the old position, so their records are left out.
     private final Set<TopicPartition> seekingPartitions = new HashSet<TopicPartition>();
 
-    // Errors Redis answers with while it cannot take writes for the moment: loading
-    // its dataset, blocked by a script, demoted to a replica, unable to persist, out
-    // of memory, or without enough replicas. Retried, they pass.
-    private static final String[] TRANSIENT_ERRORS = {
-        "LOADING", "BUSY", "READONLY", "MISCONF", "OOM", "MASTERDOWN", "NOREPLICAS", "TRYAGAIN", "CLUSTERDOWN" };
-    private static final String EXECABORT_CAUSE = "EXECABORT Transaction discarded because of: ";
-    private static final String EXEC_WITHOUT_MULTI = "EXEC without MULTI";
+    // Where each of those seeks went, until the partition delivers its next record,
+    // see checkSoughtOffsets().
+    private final Map<TopicPartition, Long> soughtOffsets = new HashMap<TopicPartition, Long>();
 
     // Sensors are registered by name for the whole worker; this keeps the ones of
     // two tasks (two connectors, or a task and its replacement) apart.
@@ -127,6 +123,7 @@ public class RedisSinkTask extends SinkTask {
         conflictRetryBackoffMs = config.getLong(RedisSinkConfig.CONFLICT_RETRY_BACKOFF_MS);
         unseekedPartitions.clear();
         seekingPartitions.clear();
+        soughtOffsets.clear();
 
         // Prepare email sender
         mailSender = new MailSender(
@@ -170,6 +167,10 @@ public class RedisSinkTask extends SinkTask {
         } catch (NoSuchMethodError | NoClassDefFoundError e) {
             // Plugin metrics came with Kafka Connect 4.1.
             logger.warn("This Connect worker has no plugin metrics, {} is only logged", REJECTED_COMMANDS_METRIC);
+        } catch (RuntimeException e) {
+            // For one, the metric of a replaced task that is still shutting down:
+            // "a metric named ... already exists". Not worth failing the task over.
+            logger.warn("Could not register the metric {}, it is only logged", REJECTED_COMMANDS_METRIC, e);
         }
     }
 
@@ -192,6 +193,7 @@ public class RedisSinkTask extends SinkTask {
     public void close(Collection<TopicPartition> partitions) {
         unseekedPartitions.removeAll(partitions);
         seekingPartitions.removeAll(partitions);
+        soughtOffsets.keySet().removeAll(partitions);
     }
 
     @Override
@@ -222,38 +224,15 @@ public class RedisSinkTask extends SinkTask {
         logger.debug("Received {} records from Connect", records.size());
 
         List<PendingWrite> pendingWrites = new ArrayList<PendingWrite>();
-        // Parse every record up front, before touching Redis, so a malformed payload
-        // fails the batch without anything of it being written.
         for (SinkRecord record : records) {
             logger.debug("Processing record: {}", record);
-
-            String key = record.key() == null ? "" : record.key().toString();
-            String value = record.value() == null ? "" : record.value().toString();
 
             // Where the consumer read the record, not where a transformation
             // (a topic router, for one) says it is: these are the coordinates
             // the consumer is assigned and can be moved to.
-            TopicPartition partition = new TopicPartition(record.originalTopic(), record.originalKafkaPartition());
-
-            try {
-                JSONObject json = new JSONObject(value);
-                double billedCredits = json.getDouble("billed_credits");
-                long expireAtValue = json.getLong("expiration");
-
-                pendingWrites.add(new PendingWrite(partition, record.originalKafkaOffset(), key, billedCredits,
-                        expireAtValue, json));
-            } catch (JSONException e) {
-                // Only JSON/field-shape problems are "bad data" — surface as a
-                // non-retriable DataException. Anything unexpected propagates with
-                // its real type rather than being mislabelled a parsing error.
-                // Nothing of the batch is written and the stored offset stays before
-                // it, so the task fails on this record again until the offset is
-                // moved past it by hand (see the README).
-                logger.error("Data or parsing error for record {} offset {}: {}", partition,
-                        record.originalKafkaOffset(), record, e);
-                throw new DataException("Data or parsing error for record " + partition + " offset "
-                        + record.originalKafkaOffset(), e);
-            }
+            pendingWrites.add(new PendingWrite(
+                    new TopicPartition(record.originalTopic(), record.originalKafkaPartition()),
+                    record.originalKafkaOffset(), record));
         }
 
         // Each batch is one Redis transaction (MULTI/EXEC) that applies the increments
@@ -286,7 +265,13 @@ public class RedisSinkTask extends SinkTask {
             boolean watching = !pendingWrites.isEmpty();
             Map<TopicPartition, Long> storedOffsets = readStoredOffsets(pendingWrites, watching);
             seekToStoredOffsets(pendingWrites, storedOffsets);
+            checkSoughtOffsets(pendingWrites);
             pendingWrites = notYetApplied(pendingWrites, storedOffsets);
+
+            // Only what is left is parsed, before anything is written: a malformed
+            // payload fails the batch as a whole, but not once the stored offset has
+            // been moved past it by hand.
+            parse(pendingWrites);
 
             if (pendingWrites.isEmpty()) {
                 if (watching) {
@@ -364,19 +349,11 @@ public class RedisSinkTask extends SinkTask {
             closeRedisConnection();
             throw new ConnectException("Redis access control error", e);
         } catch (JedisDataException e) {
-            if (isTransient(e)) {
-                // Redis refused the read or the whole transaction because it cannot
-                // take writes right now. Nothing was applied, so retry the batch. On
-                // a new connection: after a failover the sentinels name another
-                // master.
-                logger.warn("Redis is temporarily not accepting writes, will retry batch", e);
-                closeRedisConnection();
-                context.timeout(retryBackoffMs);
-                throw new RetriableException("Redis is temporarily not accepting writes", e);
-            }
-            // Server refused a read or the whole transaction for a reason retrying
-            // cannot fix (e.g. the offset hash holds another type). Surface it as a
-            // non-retriable DataException instead of looping on it.
+            // Server refused a read or the whole transaction: the offset hash holds
+            // another type, or Redis does not take writes right now (LOADING,
+            // READONLY, MISCONF, OOM). Nothing was applied. Not retried here: the
+            // task fails, and whatever restarts failed tasks retries with its own
+            // backoff and gives up visibly when Redis stays that way.
             logger.error("Redis command/data error", e);
             closeRedisConnection();
             throw new DataException("Redis command/data error", e);
@@ -400,54 +377,65 @@ public class RedisSinkTask extends SinkTask {
         }
     }
 
+    private void parse(List<PendingWrite> pendingWrites) {
+        for (PendingWrite write : pendingWrites) {
+            try {
+                write.parse();
+            } catch (JSONException e) {
+                // Only JSON/field-shape problems are "bad data" — surface as a
+                // non-retriable DataException. Anything unexpected propagates with
+                // its real type rather than being mislabelled a parsing error.
+                // Nothing of the batch is written and the stored offset stays before
+                // it, so the task fails on this record again until the offset is
+                // moved past it by hand (see the README).
+                logger.error("Data or parsing error for record {} offset {}: {}", write.partition, write.offset,
+                        write.record, e);
+                throw new DataException("Data or parsing error for record " + write.partition + " offset "
+                        + write.offset, e);
+            }
+        }
+    }
+
+    /**
+     * Fails the task when a partition does not continue where the task moved it to.
+     * Kafka then did not have that offset and started the consumer over: the offset
+     * stored in Redis is beyond the end of the partition, so it belongs to another
+     * topic or another cluster. Carrying on would skip every record up to that offset
+     * as already applied.
+     */
+    private void checkSoughtOffsets(List<PendingWrite> pendingWrites) {
+        if (soughtOffsets.isEmpty()) {
+            return;
+        }
+        Map<TopicPartition, Long> firstInHand = new HashMap<TopicPartition, Long>();
+        for (PendingWrite write : pendingWrites) {
+            firstInHand.merge(write.partition, write.offset, Math::min);
+        }
+
+        for (Map.Entry<TopicPartition, Long> first : firstInHand.entrySet()) {
+            TopicPartition partition = first.getKey();
+            // Still the batch read before the seek was carried out.
+            if (seekingPartitions.contains(partition)) {
+                continue;
+            }
+            Long sought = soughtOffsets.remove(partition);
+            if (sought != null && first.getValue() < sought) {
+                throw new ConnectException("Asked Kafka to continue " + partition + " at offset " + sought
+                        + ", the record after the last one applied to Redis, but it delivered offset "
+                        + first.getValue() + ". The offset stored in Redis is beyond the end of the partition, "
+                        + "so it belongs to another topic or cluster. Delete field " + partition.partition()
+                        + " of the Redis hash " + offsetsKey(partition.topic()) + " to start from the "
+                        + "consumer group's position.");
+            }
+        }
+    }
+
     private void reportRejected(String command, PendingWrite write, JedisDataException e) {
         logger.error("Redis rejected {} for key {} (record {} offset {}), the rest of the batch is applied: {}",
                 command, write.key, write.partition, write.offset, e.getMessage());
         if (rejectedCommands != null) {
             rejectedCommands.record();
         }
-    }
-
-    /**
-     * Whether Redis refused a command, or a transaction as a whole, for a reason that
-     * passes. A discarded transaction (EXECABORT) names the reason in its message or,
-     * when a command was refused while it was queued, carries the refusals as
-     * suppressed exceptions; it is transient when all of them are.
-     */
-    static boolean isTransient(JedisDataException e) {
-        String message = e.getMessage() == null ? "" : e.getMessage();
-        if (message.contains(EXEC_WITHOUT_MULTI)) {
-            // Redis refused MULTI but not EXEC, so it may have run commands in
-            // between on their own, outside a transaction. Whether and which is
-            // unknown: retrying could count them twice.
-            return false;
-        }
-        if (message.startsWith(EXECABORT_CAUSE)) {
-            message = message.substring(EXECABORT_CAUSE.length());
-        }
-        if (isTransientError(message)) {
-            return true;
-        }
-
-        Throwable[] refusals = e.getSuppressed();
-        for (Throwable refusal : refusals) {
-            if (!(refusal instanceof JedisDataException) || !isTransientError(refusal.getMessage())) {
-                return false;
-            }
-        }
-        return refusals.length > 0;
-    }
-
-    private static boolean isTransientError(String message) {
-        if (message == null) {
-            return false;
-        }
-        for (String error : TRANSIENT_ERRORS) {
-            if (message.equals(error) || message.startsWith(error + " ")) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private void sendMails(List<HttpPost> mailRequests) {
@@ -587,6 +575,7 @@ public class RedisSinkTask extends SinkTask {
                 }
                 context.offset(partition, storedOffset + 1);
                 seekingPartitions.add(partition);
+                soughtOffsets.put(partition, storedOffset + 1);
             } else if (topicsWithOffsets.contains(partition.topic())) {
                 // Gets its entry with the first record applied. A snapshot taken
                 // before that restores this partition to wherever the consumer group
@@ -703,28 +692,34 @@ public class RedisSinkTask extends SinkTask {
     }
 
     /**
-     * A parsed sink record awaiting its write. The responses hold the results of its
-     * commands once the transaction is executed.
+     * A sink record awaiting its write: first only where it was read from, then,
+     * unless it is applied already, its parsed value. The responses hold the results
+     * of its commands once the transaction is executed.
      */
     private static final class PendingWrite {
         final TopicPartition partition;
         final long offset;
-        final String key;
-        final double billedCredits;
-        final long expireAt;
-        final JSONObject json;
+        final SinkRecord record;
+        String key;
+        double billedCredits;
+        long expireAt;
+        JSONObject json;
         Response<Double> response;
         Response<Long> expireResponse;
         double newBilledCredits;
         boolean incrementRejected;
-        PendingWrite(TopicPartition partition, long offset, String key, double billedCredits, long expireAt,
-                JSONObject json) {
+
+        PendingWrite(TopicPartition partition, long offset, SinkRecord record) {
             this.partition = partition;
             this.offset = offset;
-            this.key = key;
-            this.billedCredits = billedCredits;
-            this.expireAt = expireAt;
-            this.json = json;
+            this.record = record;
+        }
+
+        void parse() throws JSONException {
+            key = record.key() == null ? "" : record.key().toString();
+            json = new JSONObject(record.value() == null ? "" : record.value().toString());
+            billedCredits = json.getDouble("billed_credits");
+            expireAt = json.getLong("expiration");
         }
     }
 }

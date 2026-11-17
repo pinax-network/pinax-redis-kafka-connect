@@ -1,9 +1,7 @@
 package com.pinax.kafka.redis.connect.sink;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyDouble;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -191,54 +189,57 @@ class RedisSinkTaskTest {
     }
 
     @Test
-    void put_redisLoading_throwsRetriable() {
+    void put_redisNotAcceptingWrites_failsTheTask() {
+        // Left to whatever restarts failed tasks, with its own backoff.
         withConnectedRedis(mailSender -> {
             when(jedis.hgetAll(anyString()))
                     .thenThrow(new JedisDataException("LOADING Redis is loading the dataset in memory"));
 
-            assertThrows(RetriableException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON))));
-            verify(context).timeout(5000L);
+            assertThrows(DataException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON))));
+            verify(context, never()).timeout(anyLong());
         });
     }
 
     @Test
-    void put_transactionDiscardedForATransientReason_throwsRetriable() {
-        // A command refused while it was queued: Jedis attaches the refusal to the
-        // EXECABORT error as a suppressed exception.
+    void put_malformedRecordAtOrBelowTheStoredOffset_isNotParsed() {
+        // The way past a record that cannot be parsed: the stored offset was moved
+        // to it by hand. Kafka still delivers it, the consumer group is before it.
         withConnectedRedis(mailSender -> {
             stubIncrByFloat(1.0);
-            JedisDataException aborted = new JedisDataException(
-                    "EXECABORT Transaction discarded because of previous errors.");
-            aborted.addSuppressed(new JedisDataException("OOM command not allowed when used memory > 'maxmemory'."));
-            when(transaction.exec()).thenThrow(aborted);
+            storedOffset(8L);
 
-            assertThrows(RetriableException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON))));
+            assertDoesNotThrow(() -> task.put(List.of(
+                    record("team:1", "this is not json", 8L), record("team:2", CREDITS_JSON, 9L))));
+
+            verify(transaction, times(1)).incrByFloat(eq("team:2"), anyDouble());
+            verify(transaction).hset(OFFSETS_KEY, "0", "9");
         });
     }
 
     @Test
-    void isTransient_tellsPassingRefusalsFromPermanentOnes() {
-        assertTrue(RedisSinkTask.isTransient(new JedisDataException("READONLY You can't write against a read only replica.")));
-        assertTrue(RedisSinkTask.isTransient(new JedisDataException("MISCONF Redis is configured to save RDB snapshots")));
-        assertTrue(RedisSinkTask.isTransient(new JedisDataException(
-                "EXECABORT Transaction discarded because of: READONLY You can't write against a read only replica.")));
+    void start_metricCannotBeRegistered_isTolerated() {
+        when(context.pluginMetrics()).thenThrow(new IllegalArgumentException("A metric named x already exists"));
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
 
-        assertFalse(RedisSinkTask.isTransient(new JedisDataException("WRONGTYPE Operation against a key")));
+            assertDoesNotThrow(() -> task.put(List.of(record("team:1", CREDITS_JSON))));
+        });
+    }
 
-        // MULTI was refused but EXEC was not: commands may have run in between.
-        JedisDataException noMulti = new JedisDataException("ERR EXEC without MULTI");
-        noMulti.addSuppressed(new JedisDataException("BUSY Redis is busy running a script"));
-        assertFalse(RedisSinkTask.isTransient(noMulti));
-        assertFalse(RedisSinkTask.isTransient(new JedisDataException("ERR value is not a valid float")));
-        // No reason given: not known to pass.
-        assertFalse(RedisSinkTask.isTransient(new JedisDataException(
-                "EXECABORT Transaction discarded because of previous errors.")));
+    @Test
+    void assignedPartition_kafkaDoesNotHaveTheStoredOffset_failsTheTask() {
+        // The hash is from another topic or cluster: offset 5000 is beyond the end of
+        // this partition, so the consumer starts over at the earliest record.
+        withConnectedRedis(mailSender -> {
+            storedOffset(5000L);
 
-        JedisDataException mixed = new JedisDataException(
-                "EXECABORT Transaction discarded because of previous errors.");
-        mixed.addSuppressed(new JedisDataException("OOM command not allowed"));
-        mixed.addSuppressed(new JedisDataException("ERR wrong number of arguments"));
-        assertFalse(RedisSinkTask.isTransient(mixed));
+            task.open(List.of(PARTITION));
+            task.put(Collections.emptyList());
+            verify(context).offset(PARTITION, 5001L);
+
+            assertThrows(ConnectException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON, 0L))));
+            verify(jedis, never()).multi();
+        });
     }
 
     @Test

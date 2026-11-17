@@ -62,7 +62,7 @@ and restart the worker.
 | `master`          | no       | `mymaster`           | Redis Sentinel master name.                                     |
 | `hosts`           | no       | `localhost:6379`     | Comma-separated list of Sentinel `host:port` addresses.         |
 | `offsetsKey`      | no       | `kafka-connect:redis-sink:offsets` | Prefix of the hashes holding the applied offsets, one per topic (`<offsetsKey>:<topic>`). |
-| `retryBackoffMs`  | no       | `5000`               | Milliseconds before a batch is retried after Redis was unreachable or not accepting writes. |
+| `retryBackoffMs`  | no       | `5000`               | Milliseconds before a batch is retried after Redis was unreachable. |
 | `conflictRetryBackoffMs` | no | `1000`              | Milliseconds before a batch is retried after its transaction was refused because the stored offsets changed. |
 | `from`            | no       | `info@pinax.network` | `From` address for notification emails (must be a valid email). |
 | `mailchimpApiKey` | **yes**  | —                    | Mandrill / Mailchimp Transactional API key.                     |
@@ -179,8 +179,10 @@ multiples of the allowance. If a single batch leaps past several at once, only t
     snapshot; it logs a warning with the number of records whenever it moves a partition
     back behind the batch in hand.
   - The offsets belong to one Kafka cluster. When the connector is pointed at another
-    cluster or a re-created topic, delete `<offsetsKey>:<topic>` first, or the stored
-    offsets are applied to the new topic.
+    cluster or a re-created topic, delete `<offsetsKey>:<topic>` first. The task fails
+    when it notices: it moves a partition to a stored offset the topic does not have,
+    and Kafka starts the consumer over. A stored offset the new topic does have cannot
+    be told apart and is applied to it.
 - **A single task.** The offsets of all partitions of a topic are in one hash, and every
   transaction `WATCH`es it, so tasks running side by side would refuse each other's
   transactions. The connector therefore always creates one task. A config with
@@ -189,7 +191,7 @@ multiples of the allowance. If a single batch leaps past several at once, only t
   not noticed yet: when it stored offsets in between, the transaction is refused,
   nothing is applied and the batch is retried after `conflictRetryBackoffMs`.
 - **Retries.** A batch that failed for a passing reason is delivered again by Connect
-  after `retryBackoffMs` (Redis unreachable or not accepting writes) or
+  after `retryBackoffMs` (Redis unreachable) or
   `conflictRetryBackoffMs` (transaction refused).
 - **Not rolled back.** Redis does not undo a transaction when it rejects one of its
   commands: the rest of the batch and the offsets are applied.
@@ -204,7 +206,8 @@ multiples of the allowance. If a single batch leaps past several at once, only t
   `billed_credits` or `expiration` fails its batch with a `DataException` before
   anything of it is written. The stored offset stays before the batch, so the task fails
   on the same record again after a restart, until the producer's data is dealt with and
-  the partition is moved past the record by hand (below).
+  the partition is moved past the record by hand (below). Records at or below the stored
+  offset are not parsed, so that gets the task past it.
 - **Metric.** `rejected-commands-total` counts the rejected commands above. It is a
   Connect plugin metric (JMX: `kafka.connect:type=plugins,connector=…,task=…`) and needs
   a Kafka Connect 4.1+ worker; on older workers the rejections are only logged. Alert
@@ -220,7 +223,8 @@ multiples of the allowance. If a single batch leaps past several at once, only t
   | Connection loss, pool exhaustion, sentinel failover (`JedisException`) | `RetriableException` | Connect retries the batch |
   | Offsets changed by another task between `WATCH` and `EXEC` | `RetriableException` | Connect retries the batch |
   | Auth / ACL error (`JedisAccessControlException`) | `ConnectException` | Task fails fast (permanent misconfig) |
-  | Redis temporarily not accepting writes — `LOADING`, `BUSY`, `READONLY`, `MISCONF`, `OOM`, `NOREPLICAS`, also as the reason of an `EXECABORT` | `RetriableException` | Nothing was applied; Connect retries the batch on a new connection |
+  | Redis reachable but refusing reads or writes — `LOADING`, `BUSY`, `READONLY`, `MISCONF`, `OOM`, also as the reason of an `EXECABORT` (`JedisDataException`) | `DataException` | Nothing was applied; the task fails and is left to whatever restarts failed tasks |
+  | Kafka does not have the offset stored in Redis | `ConnectException` | Task fails before anything is written; the offset hash belongs to another topic or cluster |
   | Increment or expiration of one record rejected inside the transaction | none | Logged, counted in `rejected-commands-total`, task carries on |
   | Offsets rejected inside the transaction, or another permanent error on the offset hash (`JedisDataException`) | `DataException` | Non-retriable (retrying can't help) |
   | Record value that cannot be parsed (`JSONException`) | `DataException` | Non-retriable; nothing of the batch is written |
@@ -247,7 +251,8 @@ mvn verify
   Start a real Redis container and verify the transaction semantics the task relies on
   (accumulation, TTL, stored offsets, a refused transaction after a concurrent offset
   change, and that per-command errors surface at `Response.get()`). They
-  **self-skip** when no Docker daemon is available.
+  **self-skip** when no Docker daemon is available, except in CI (`CI` set in the
+  environment), where a missing daemon fails the build.
 
 ## Static analysis
 

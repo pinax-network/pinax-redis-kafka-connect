@@ -35,7 +35,8 @@ import redis.clients.jedis.exceptions.JedisDataException;
  * Testing the transaction primitives directly keeps the integration test reliable
  * while still covering the behaviour the task's exception handling depends on.
  *
- * <p>Self-skips (rather than fails) when no Docker daemon is available.
+ * <p>Self-skips (rather than fails) when no Docker daemon is available, except in
+ * CI (environment variable {@code CI} set), where that fails the build.
  */
 class RedisSinkIT {
 
@@ -44,7 +45,13 @@ class RedisSinkIT {
 
     @BeforeAll
     static void startRedis() {
-        assumeTrue(DockerClientFactory.instance().isDockerAvailable(), "Docker is not available");
+        boolean dockerAvailable = DockerClientFactory.instance().isDockerAvailable();
+        // CI must run these: a skip there once went unnoticed for a long time.
+        String ci = System.getenv("CI");
+        if (ci != null && !ci.isEmpty()) {
+            assertTrue(dockerAvailable, "Docker is not available in CI, the integration tests would be skipped");
+        }
+        assumeTrue(dockerAvailable, "Docker is not available");
         redis = new GenericContainer<>(DockerImageName.parse("redis:7-alpine"))
                 .withExposedPorts(6379)
                 .waitingFor(Wait.forListeningPort());
