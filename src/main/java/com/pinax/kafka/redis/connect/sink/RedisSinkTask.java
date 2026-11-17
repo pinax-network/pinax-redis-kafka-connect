@@ -12,8 +12,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.HashSet;
 
@@ -27,7 +25,6 @@ import org.apache.kafka.common.metrics.stats.CumulativeSum;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.errors.DataException;
-import org.apache.kafka.connect.sink.ErrantRecordReporter;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
 import org.json.JSONException;
@@ -79,21 +76,11 @@ public class RedisSinkTask extends SinkTask {
     // two tasks (two connectors, or a task and its replacement) apart.
     private static final AtomicInteger SENSOR_IDS = new AtomicInteger();
 
-    // How long to wait for a skipped record to reach the dead letter queue.
-    private static final long DEAD_LETTER_TIMEOUT_MS = 10000L;
-
     static final String REJECTED_COMMANDS_METRIC = "rejected-commands-total";
-    static final String INVALID_RECORDS_METRIC = "invalid-records-total";
 
-    // Count the commands of committed batches that Redis rejected, and the records
-    // skipped because they could not be parsed. Null when the Connect worker does not
-    // offer plugin metrics.
+    // Counts the commands of committed batches that Redis rejected. Null when the
+    // Connect worker does not offer plugin metrics.
     private Sensor rejectedCommands = null;
-    private Sensor invalidRecords = null;
-
-    // Hands skipped records to the dead letter queue. Null when the connector is not
-    // configured with one.
-    private ErrantRecordReporter errantRecordReporter = null;
 
     private void createRedisConnection() {
         // Let connection failures propagate. Callers decide how to react: startup
@@ -152,11 +139,6 @@ public class RedisSinkTask extends SinkTask {
         }
 
         registerMetrics();
-        try {
-            errantRecordReporter = context.errantRecordReporter();
-        } catch (NoSuchMethodError | NoClassDefFoundError e) {
-            errantRecordReporter = null;
-        }
 
         try {
             createRedisConnection();
@@ -176,22 +158,18 @@ public class RedisSinkTask extends SinkTask {
 
     private void registerMetrics() {
         rejectedCommands = null;
-        invalidRecords = null;
         try {
             PluginMetrics metrics = context.pluginMetrics();
             if (metrics == null) {
                 return;
             }
-            int id = SENSOR_IDS.incrementAndGet();
-            rejectedCommands = counter(metrics, "rejected-commands-" + id, REJECTED_COMMANDS_METRIC,
+            rejectedCommands = counter(metrics, "rejected-commands-" + SENSOR_IDS.incrementAndGet(),
+                    REJECTED_COMMANDS_METRIC,
                     "Commands of committed batches that Redis rejected (wrong key type, value not a number, "
                             + "invalid expiration). The record's increment or expiration was not applied.");
-            invalidRecords = counter(metrics, "invalid-records-" + id, INVALID_RECORDS_METRIC,
-                    "Records skipped because their value could not be parsed. Nothing was counted for them.");
         } catch (NoSuchMethodError | NoClassDefFoundError e) {
             // Plugin metrics came with Kafka Connect 4.1.
-            logger.warn("This Connect worker has no plugin metrics, {} and {} are only logged",
-                    REJECTED_COMMANDS_METRIC, INVALID_RECORDS_METRIC);
+            logger.warn("This Connect worker has no plugin metrics, {} is only logged", REJECTED_COMMANDS_METRIC);
         }
     }
 
@@ -244,7 +222,8 @@ public class RedisSinkTask extends SinkTask {
         logger.debug("Received {} records from Connect", records.size());
 
         List<PendingWrite> pendingWrites = new ArrayList<PendingWrite>();
-        // Parse every record up front, before touching Redis.
+        // Parse every record up front, before touching Redis, so a malformed payload
+        // fails the batch without anything of it being written.
         for (SinkRecord record : records) {
             logger.debug("Processing record: {}", record);
 
@@ -264,12 +243,16 @@ public class RedisSinkTask extends SinkTask {
                 pendingWrites.add(new PendingWrite(partition, record.originalKafkaOffset(), key, billedCredits,
                         expireAtValue, json));
             } catch (JSONException e) {
-                // Only JSON/field-shape problems are "bad data"; anything unexpected
-                // propagates with its real type. A record that cannot be parsed never
-                // will be, so it must not hold up the partition: it writes nothing,
-                // but the stored offset moves past it with the rest of the batch. It
-                // is reported once that is committed, see reportInvalid().
-                pendingWrites.add(PendingWrite.invalid(partition, record.originalKafkaOffset(), key, record, e));
+                // Only JSON/field-shape problems are "bad data" — surface as a
+                // non-retriable DataException. Anything unexpected propagates with
+                // its real type rather than being mislabelled a parsing error.
+                // Nothing of the batch is written and the stored offset stays before
+                // it, so the task fails on this record again until the offset is
+                // moved past it by hand (see the README).
+                logger.error("Data or parsing error for record {} offset {}: {}", partition,
+                        record.originalKafkaOffset(), record, e);
+                throw new DataException("Data or parsing error for record " + partition + " offset "
+                        + record.originalKafkaOffset(), e);
             }
         }
 
@@ -312,20 +295,12 @@ public class RedisSinkTask extends SinkTask {
                 return new ArrayList<HttpPost>();
             }
 
-            // Before the transaction moves the stored offset past them: once it has,
-            // they are never delivered again. A batch that is retried sends them a
-            // second time.
-            sendToDeadLetterQueue(pendingWrites);
-
             Map<TopicPartition, Long> appliedOffsets = new HashMap<TopicPartition, Long>();
             List<Response<Long>> offsetResponses = new ArrayList<Response<Long>>();
             Transaction transaction = jedis.multi();
 
             for (PendingWrite write : pendingWrites) {
                 appliedOffsets.merge(write.partition, write.offset, Math::max);
-                if (write.isInvalid()) {
-                    continue;
-                }
                 write.response = transaction.incrByFloat(write.key, write.billedCredits);
                 write.expireResponse = transaction.expireAt(write.key, write.expireAt);
             }
@@ -358,12 +333,6 @@ public class RedisSinkTask extends SinkTask {
             // rest of the batch is applied and nothing can be retried, so it is
             // reported and the task carries on.
             for (PendingWrite write : pendingWrites) {
-                if (write.isInvalid()) {
-                    // Logged and counted only now that the offset behind it is
-                    // stored, so a batch that is retried does not count it again.
-                    reportInvalid(write);
-                    continue;
-                }
                 try {
                     write.newBilledCredits = write.response.get();
                 } catch (JedisDataException e) {
@@ -428,66 +397,6 @@ public class RedisSinkTask extends SinkTask {
             logger.error("Non-retriable error while writing batch to Redis", e);
             closeRedisConnection();
             throw new DataException("Non-retriable error while writing batch to Redis", e);
-        }
-    }
-
-    private void reportInvalid(PendingWrite write) {
-        logger.error("Skipping record that cannot be parsed: key {} ({} offset {}): {}",
-                write.key, write.partition, write.offset, write.parseError.getMessage());
-        if (invalidRecords != null) {
-            invalidRecords.record();
-        }
-    }
-
-    /**
-     * Hands the records of the batch that cannot be parsed to Connect's dead letter
-     * queue, if the connector has one, and waits for them to be written: all of them
-     * together, for no longer than DEAD_LETTER_TIMEOUT_MS. Never fails the batch: the
-     * reporter throws when errors.tolerance is none, and a record that cannot reach
-     * the queue must not hold up the partition any more than one that cannot be
-     * parsed.
-     */
-    private void sendToDeadLetterQueue(List<PendingWrite> pendingWrites) {
-        if (errantRecordReporter == null) {
-            return;
-        }
-
-        int notSent = 0;
-        Exception firstFailure = null;
-        List<Future<Void>> sending = new ArrayList<Future<Void>>();
-        for (PendingWrite write : pendingWrites) {
-            if (!write.isInvalid()) {
-                continue;
-            }
-            try {
-                Future<Void> sent = errantRecordReporter.report(write.record, write.parseError);
-                if (sent != null) {
-                    sending.add(sent);
-                }
-            } catch (RuntimeException e) {
-                notSent++;
-                firstFailure = firstFailure == null ? e : firstFailure;
-            }
-        }
-
-        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(DEAD_LETTER_TIMEOUT_MS);
-        for (Future<Void> sent : sending) {
-            try {
-                sent.get(Math.max(0L, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                notSent++;
-                firstFailure = firstFailure == null ? e : firstFailure;
-                break;
-            } catch (Exception e) {
-                notSent++;
-                firstFailure = firstFailure == null ? e : firstFailure;
-            }
-        }
-
-        if (notSent > 0) {
-            logger.error("Could not send {} records to the dead letter queue, skipping them anyway", notSent,
-                    firstFailure);
         }
     }
 
@@ -719,7 +628,7 @@ public class RedisSinkTask extends SinkTask {
 
         for (PendingWrite write : pendingWrites) {
             // Nothing was added for this record, so it crossed no milestone.
-            if (write.isInvalid() || write.incrementRejected) {
+            if (write.incrementRejected) {
                 continue;
             }
             double newBilledCredits = write.newBilledCredits;
@@ -795,8 +704,7 @@ public class RedisSinkTask extends SinkTask {
 
     /**
      * A parsed sink record awaiting its write. The responses hold the results of its
-     * commands once the transaction is executed. A record that could not be parsed
-     * has no commands; it only moves the stored offset.
+     * commands once the transaction is executed.
      */
     private static final class PendingWrite {
         final TopicPartition partition;
@@ -809,21 +717,6 @@ public class RedisSinkTask extends SinkTask {
         Response<Long> expireResponse;
         double newBilledCredits;
         boolean incrementRejected;
-        SinkRecord record;
-        JSONException parseError;
-
-        static PendingWrite invalid(TopicPartition partition, long offset, String key, SinkRecord record,
-                JSONException parseError) {
-            PendingWrite write = new PendingWrite(partition, offset, key, 0, 0, null);
-            write.record = record;
-            write.parseError = parseError;
-            return write;
-        }
-
-        boolean isInvalid() {
-            return parseError != null;
-        }
-
         PendingWrite(TopicPartition partition, long offset, String key, double billedCredits, long expireAt,
                 JSONObject json) {
             this.partition = partition;
