@@ -198,10 +198,20 @@ multiples of the allowance. If a single batch leaps past several at once, only t
     notification; the other records of the batch do.
   - Offsets that could not be stored fail the task with a `DataException`: carrying on
     would count the batch again after the next restart.
-- **Metric.** `rejected-commands-total` counts the rejected commands above. It is a
-  Connect plugin metric (JMX: `kafka.connect:type=plugins,connector=…,task=…`) and needs
-  a Kafka Connect 4.1+ worker; on older workers the rejections are only logged. Alert
-  on any increase.
+- **Invalid records are skipped.** A record whose value is not JSON or lacks
+  `billed_credits` or `expiration` can never be applied. It is logged as an error with
+  key, topic, partition and offset, counted in the `invalid-records-total` metric, and
+  the stored offset moves past it with the rest of its batch. When the connector has a
+  dead letter queue (`errors.tolerance=all`, `errors.deadletterqueue.topic.name`), the
+  record is sent there.
+- **Metrics.** `rejected-commands-total` and `invalid-records-total` count the two
+  cases above. They are Connect plugin metrics (JMX:
+  `kafka.connect:type=plugins,connector=…,task=…`) and need a Kafka Connect 4.1+ worker;
+  on older workers both are only logged. Alert on any increase.
+- **Moving a partition by hand.** Resetting the consumer group has no effect on a
+  partition with a stored offset. To skip or repeat records, stop the connector, set the
+  offset of the last record to treat as applied with
+  `HSET <offsetsKey>:<topic> <partition> <offset>`, and start it again.
 - **Error classification** (`put()` maps Redis failures to the right Connect signal):
 
   | Failure | Mapped to | Effect |
@@ -212,7 +222,7 @@ multiples of the allowance. If a single batch leaps past several at once, only t
   | Redis temporarily not accepting writes — `LOADING`, `BUSY`, `READONLY`, `MISCONF`, `OOM`, `NOREPLICAS`, also as the reason of an `EXECABORT` | `RetriableException` | Nothing was applied; Connect retries the batch on a new connection |
   | Increment or expiration of one record rejected inside the transaction | none | Logged, counted in `rejected-commands-total`, task carries on |
   | Offsets rejected inside the transaction, or another permanent error on the offset hash (`JedisDataException`) | `DataException` | Non-retriable (retrying can't help) |
-  | Malformed record payload (`JSONException`) | `DataException` | Non-retriable |
+  | Record value that cannot be parsed (`JSONException`) | none | Logged, counted in `invalid-records-total`, sent to the dead letter queue if configured, task carries on |
 
 - **Connection lifecycle.** A failed batch drops and rebuilds the Redis connection on
   the next `put()`; a transient outage at startup is tolerated and retried lazily.

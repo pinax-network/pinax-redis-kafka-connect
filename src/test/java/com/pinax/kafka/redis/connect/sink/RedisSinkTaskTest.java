@@ -29,6 +29,7 @@ import org.apache.kafka.common.metrics.Sensor;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.errors.RetriableException;
+import org.apache.kafka.connect.sink.ErrantRecordReporter;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTaskContext;
 import org.junit.jupiter.api.BeforeEach;
@@ -60,6 +61,7 @@ class RedisSinkTaskTest {
     private Transaction transaction;
     private SinkTaskContext context;
     private Sensor rejectedCommands;
+    private Sensor invalidRecords;
     private RedisSinkTask task;
 
     @BeforeEach
@@ -76,7 +78,9 @@ class RedisSinkTaskTest {
         PluginMetrics metrics = mock(PluginMetrics.class);
         rejectedCommands = mock(Sensor.class);
         when(context.pluginMetrics()).thenReturn(metrics);
-        when(metrics.addSensor(anyString())).thenReturn(rejectedCommands);
+        invalidRecords = mock(Sensor.class);
+        when(metrics.addSensor("rejected-commands")).thenReturn(rejectedCommands);
+        when(metrics.addSensor("invalid-records")).thenReturn(invalidRecords);
         task = new RedisSinkTask();
         task.initialize(context);
     }
@@ -141,10 +145,46 @@ class RedisSinkTaskTest {
     }
 
     @Test
-    void put_malformedJson_throwsDataException() {
+    void put_malformedJson_isSkippedAndTheOffsetMovesPastIt() {
         withConnectedRedis(mailSender -> {
-            List<SinkRecord> records = List.of(record("team:1", "this is not json"));
-            assertThrows(DataException.class, () -> task.put(records));
+            stubIncrByFloat(1.0);
+
+            assertDoesNotThrow(() -> task.put(List.of(
+                    record("team:1", CREDITS_JSON, 7L), record("team:2", "this is not json", 8L))));
+
+            verify(transaction, times(1)).incrByFloat(anyString(), anyDouble());
+            verify(transaction).hset(OFFSETS_KEY, "0", "8");
+            verify(invalidRecords).record();
+        });
+    }
+
+    @Test
+    void put_onlyMalformedRecords_stillStoresTheOffset() {
+        withConnectedRedis(mailSender -> {
+            assertDoesNotThrow(() -> task.put(List.of(record("team:1", "this is not json", 8L))));
+
+            verify(transaction, never()).incrByFloat(anyString(), anyDouble());
+            verify(transaction).hset(OFFSETS_KEY, "0", "8");
+            verify(invalidRecords).record();
+        });
+    }
+
+    @Test
+    void put_malformedJson_isReportedOnceTheBatchIsCommitted() {
+        // Not on the attempt that failed: the retry would report it a second time.
+        ErrantRecordReporter reporter = mock(ErrantRecordReporter.class);
+        when(context.errantRecordReporter()).thenReturn(reporter);
+        withConnectedRedis(mailSender -> {
+            when(transaction.exec()).thenThrow(new JedisConnectionException("connection reset"))
+                    .thenReturn(List.of());
+            SinkRecord malformed = record("team:1", "this is not json", 8L);
+
+            assertThrows(RetriableException.class, () -> task.put(List.of(malformed)));
+            verify(reporter, never()).report(any(SinkRecord.class), any(Throwable.class));
+
+            task.put(List.of(malformed));
+            verify(reporter, times(1)).report(eq(malformed), any(Throwable.class));
+            verify(invalidRecords, times(1)).record();
         });
     }
 
