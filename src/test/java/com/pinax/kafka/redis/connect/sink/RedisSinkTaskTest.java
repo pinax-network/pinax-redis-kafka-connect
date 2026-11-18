@@ -1,6 +1,7 @@
 package com.pinax.kafka.redis.connect.sink;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyDouble;
@@ -27,6 +28,7 @@ import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.mockito.MockedConstruction;
 
 import redis.clients.jedis.Jedis;
@@ -216,9 +218,22 @@ class RedisSinkTaskTest {
                     + "\"team_plan\":\"Pro\"}";
             task.put(List.of(record("team:1", json)));
 
-            verify(mailSender, times(1)).CreateUsageMailRequest(anyString(), anyString(), any(MailContent.class));
+            ArgumentCaptor<MailContent> content = ArgumentCaptor.forClass(MailContent.class);
+            verify(mailSender, times(1)).CreateUsageMailRequest(anyString(),
+                    eq("You're past your included Pro usage (150%)"), content.capture());
+            assertEquals("150", content.getValue().getUsagePercent());
             verify(mailSender, times(1)).SendUsageMailRequest(any(HttpPost.class));
         });
+    }
+
+    @Test
+    void usageMailSubject_dependsOnPlanAndMilestone() {
+        assertEquals("You've used 90% of your free Pinax credits", RedisSinkTask.usageMailSubject("free", 90));
+        assertEquals("Your Pinax service is paused: free credits used up", RedisSinkTask.usageMailSubject("free", 100));
+        assertEquals("You've used 50% of your included Pro usage", RedisSinkTask.usageMailSubject("pro", 50));
+        assertEquals("You've used all of your included Pro usage", RedisSinkTask.usageMailSubject("pro", 100));
+        assertEquals("You're past your included Pro usage (150%)", RedisSinkTask.usageMailSubject("pro", 150));
+        assertEquals("You've used 75% of this month's included usage", RedisSinkTask.usageMailSubject("enterprise", 75));
     }
 
     @Test

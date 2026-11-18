@@ -258,6 +258,8 @@ public class RedisSinkTask extends SinkTask {
                 creditThresholds.add(includedCredits * 1.00);
                 creditThresholds.add(includedCredits * 1.50);
                 creditThresholds.add(includedCredits * 2.00);
+                // The same milestones as whole percentages, for the email.
+                List<Integer> milestonePercents = List.of(50, 75, 90, 100, 150, 200);
 
                 // Format to currency and remove the currency symbol.
                 DecimalFormat formatter = (DecimalFormat) NumberFormat.getCurrencyInstance(Locale.US);
@@ -278,10 +280,11 @@ public class RedisSinkTask extends SinkTask {
                         String teamName = json.getString("team_name");
                         String teamPlan = json.getString("team_plan");
 
+                        int milestonePercent = milestonePercents.get(i);
                         MailContent mailContent = new MailContent(teamName, teamPlan, newBilledCreditsString,
-                                includedCreditsString);
+                                includedCreditsString, String.valueOf(milestonePercent));
                         mailRequests.add(mailSender.CreateUsageMailRequest(teamBillingEmail,
-                                "An Update on your Monthly Usage", mailContent)); // TODO: Change the mail subject
+                                usageMailSubject(teamPlan, milestonePercent), mailContent));
                         break;
                     }
                 }
@@ -294,6 +297,24 @@ public class RedisSinkTask extends SinkTask {
         }
 
         return mailRequests;
+    }
+
+    // Team names are mostly auto-generated (the owner's name or email address), so subjects don't include them.
+    static String usageMailSubject(String teamPlan, int milestonePercent) {
+        if ("free".equalsIgnoreCase(teamPlan)) {
+            return milestonePercent >= 100
+                    ? "Your Pinax service is paused: free credits used up"
+                    : "You've used " + milestonePercent + "% of your free Pinax credits";
+        }
+        if ("pro".equalsIgnoreCase(teamPlan)) {
+            if (milestonePercent == 100) {
+                return "You've used all of your included Pro usage";
+            }
+            return milestonePercent > 100
+                    ? "You're past your included Pro usage (" + milestonePercent + "%)"
+                    : "You've used " + milestonePercent + "% of your included Pro usage";
+        }
+        return "You've used " + milestonePercent + "% of this month's included usage";
     }
 
     @Override
