@@ -139,6 +139,10 @@ global merge vars (Mailchimp merge language, e.g. `*|TeamName|*`):
 | `IncludedCredits` | `200.00`    | the plan's included credits, in USD, no currency symbol      |
 | `UsagePercent`    | `90`        | the milestone crossed: `50`, `75`, `90`, `100`, `150` or `200` |
 
+The email template itself (`usage-notifications-template`) lives in
+[`k8s-cloud-backend/mandrill/`](https://github.com/pinax-network/k8s-cloud-backend/tree/main/mandrill),
+with every other Pinax Mandrill template, and is published from there.
+
 ## Behaviour & delivery semantics
 
 - **At-least-once.** On a retryable failure Connect re-delivers the batch. The
