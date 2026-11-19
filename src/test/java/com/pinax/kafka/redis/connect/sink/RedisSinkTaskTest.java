@@ -1,12 +1,15 @@
 package com.pinax.kafka.redis.connect.sink;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyDouble;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockConstruction;
@@ -19,20 +22,23 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.hc.client5.http.classic.methods.HttpPost;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.sink.SinkRecord;
+import org.apache.kafka.connect.sink.SinkTaskContext;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.MockedConstruction;
 
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisSentinelPool;
-import redis.clients.jedis.Pipeline;
 import redis.clients.jedis.Response;
+import redis.clients.jedis.Transaction;
 import redis.clients.jedis.exceptions.JedisAccessControlException;
 import redis.clients.jedis.exceptions.JedisConnectionException;
 import redis.clients.jedis.exceptions.JedisDataException;
@@ -41,21 +47,33 @@ import redis.clients.jedis.exceptions.JedisDataException;
  * Unit tests for {@link RedisSinkTask}. The task constructs its
  * {@link JedisSentinelPool} and {@link MailSender} directly, so we intercept
  * those constructions with Mockito (no real Redis or HTTP) and drive behaviour
- * through the mocked {@link Pipeline}. End-to-end Redis semantics are covered
+ * through the mocked {@link Transaction}. End-to-end Redis semantics are covered
  * separately by {@code RedisSinkIT}.
  */
 class RedisSinkTaskTest {
 
+    private static final String OFFSETS_KEY = "kafka-connect:redis-sink:offsets:usage";
+    private static final TopicPartition PARTITION = new TopicPartition("usage", 0);
+    private static final String CREDITS_JSON = "{\"billed_credits\":1.0,\"expiration\":9999999999}";
+
     private Jedis jedis;
-    private Pipeline pipeline;
+    private Transaction transaction;
+    private SinkTaskContext context;
     private RedisSinkTask task;
 
     @BeforeEach
+    @SuppressWarnings("unchecked")
     void setUp() {
         jedis = mock(Jedis.class);
-        pipeline = mock(Pipeline.class);
-        when(jedis.pipelined()).thenReturn(pipeline);
+        transaction = mock(Transaction.class);
+        when(jedis.multi()).thenReturn(transaction);
+        when(jedis.hgetAll(anyString())).thenReturn(new HashMap<>());
+        when(transaction.exec()).thenReturn(List.of());
+        when(transaction.expireAt(anyString(), anyLong())).thenReturn(mock(Response.class));
+        when(transaction.hset(anyString(), anyString(), anyString())).thenReturn(mock(Response.class));
+        context = mock(SinkTaskContext.class);
         task = new RedisSinkTask();
+        task.initialize(context);
     }
 
     private static Map<String, String> props() {
@@ -69,15 +87,25 @@ class RedisSinkTaskTest {
     }
 
     private static SinkRecord record(String key, String json) {
-        return new SinkRecord("usage", 0, null, key, null, json, 0L);
+        return record(key, json, 0L);
+    }
+
+    private static SinkRecord record(String key, String json, long offset) {
+        return new SinkRecord("usage", 0, null, key, null, json, offset);
+    }
+
+    /** The offset of the last record applied to partition 0, as stored in Redis. */
+    private void storedOffset(long offset) {
+        Map<String, String> offsets = new HashMap<>();
+        offsets.put("0", Long.toString(offset));
+        when(jedis.hgetAll(OFFSETS_KEY)).thenReturn(offsets);
     }
 
     @SuppressWarnings("unchecked")
     private Response<Double> stubIncrByFloat(double newValue) {
         Response<Double> response = mock(Response.class);
         when(response.get()).thenReturn(newValue);
-        when(pipeline.incrByFloat(anyString(), anyDouble())).thenReturn(response);
-        when(pipeline.expireAt(anyString(), anyLong())).thenReturn(mock(Response.class));
+        when(transaction.incrByFloat(anyString(), anyDouble())).thenReturn(response);
         return response;
     }
 
@@ -108,30 +136,116 @@ class RedisSinkTaskTest {
     }
 
     @Test
-    void put_malformedJson_throwsDataException() {
+    void put_malformedJson_appliesTheRecordsBeforeItThenFails() {
+        // The stored offset ends up right before the record that cannot be parsed,
+        // so moving it by hand skips nothing else.
         withConnectedRedis(mailSender -> {
-            List<SinkRecord> records = List.of(record("team:1", "this is not json"));
+            stubIncrByFloat(1.0);
+            List<SinkRecord> records = List.of(record("team:1", CREDITS_JSON, 7L),
+                    record("team:2", "this is not json", 8L), record("team:3", CREDITS_JSON, 9L));
+
             assertThrows(DataException.class, () -> task.put(records));
+
+            verify(transaction, times(1)).incrByFloat(anyString(), anyDouble());
+            verify(transaction).incrByFloat(eq("team:1"), anyDouble());
+            verify(transaction).hset(OFFSETS_KEY, "0", "7");
         });
     }
 
     @Test
-    void put_syncConnectionError_throwsRetriable() {
+    void put_malformedJsonFirst_failsAndWritesNothing() {
+        withConnectedRedis(mailSender -> {
+            List<SinkRecord> records = List.of(
+                    record("team:2", "this is not json", 8L), record("team:3", CREDITS_JSON, 9L));
+
+            assertThrows(DataException.class, () -> task.put(records));
+
+            verify(jedis, never()).multi();
+        });
+    }
+
+    @Test
+    void put_malformedJson_doesNotHoldUpOtherPartitions() {
         withConnectedRedis(mailSender -> {
             stubIncrByFloat(1.0);
-            doThrow(new JedisConnectionException("connection reset")).when(pipeline).sync();
+            List<SinkRecord> records = List.of(record("team:2", "this is not json", 8L),
+                    new SinkRecord("usage", 1, null, "team:3", null, CREDITS_JSON, 3L));
+
+            assertThrows(DataException.class, () -> task.put(records));
+
+            verify(transaction).incrByFloat(eq("team:3"), anyDouble());
+            verify(transaction).hset(OFFSETS_KEY, "1", "3");
+            verify(transaction, never()).hset(eq(OFFSETS_KEY), eq("0"), anyString());
+        });
+    }
+
+    @Test
+    void put_execConnectionError_throwsRetriable() {
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            when(transaction.exec()).thenThrow(new JedisConnectionException("connection reset"));
 
             List<SinkRecord> records = List.of(
                     record("team:1", "{\"billed_credits\":1.0,\"expiration\":9999999999}"));
             assertThrows(RetriableException.class, () -> task.put(records));
+            verify(context).timeout(5000L);
         });
     }
 
     @Test
-    void put_syncAccessControlError_throwsConnectException() {
+    void put_redisStaysUnreachable_failsTheTaskAfterMaxRetries() {
         withConnectedRedis(mailSender -> {
             stubIncrByFloat(1.0);
-            doThrow(new JedisAccessControlException("NOPERM")).when(pipeline).sync();
+            when(transaction.exec()).thenThrow(new JedisConnectionException("connection reset"));
+            List<SinkRecord> batch = List.of(record("team:1", CREDITS_JSON));
+
+            for (int retry = 0; retry < 12; retry++) {
+                assertThrows(RetriableException.class, () -> task.put(batch));
+            }
+            ConnectException givenUp = assertThrows(ConnectException.class, () -> task.put(batch));
+            assertFalse(givenUp instanceof RetriableException);
+        });
+    }
+
+    @Test
+    void put_retriedBatchIsGone_startsCountingRetriesAgain() {
+        // Its partitions were revoked: Connect drops the batch and calls put() empty.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            doThrow(new JedisConnectionException("connection reset")).when(transaction).exec();
+            List<SinkRecord> batch = List.of(record("team:1", CREDITS_JSON));
+
+            for (int retry = 0; retry < 12; retry++) {
+                assertThrows(RetriableException.class, () -> task.put(batch));
+            }
+            task.put(Collections.emptyList());
+
+            assertThrows(RetriableException.class, () -> task.put(batch));
+        });
+    }
+
+    @Test
+    void put_batchWentThrough_startsCountingRetriesAgain() {
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            List<SinkRecord> batch = List.of(record("team:1", CREDITS_JSON));
+
+            for (int round = 0; round < 2; round++) {
+                doThrow(new JedisConnectionException("connection reset")).when(transaction).exec();
+                for (int retry = 0; retry < 12; retry++) {
+                    assertThrows(RetriableException.class, () -> task.put(batch));
+                }
+                doReturn(List.of()).when(transaction).exec();
+                assertDoesNotThrow(() -> task.put(batch));
+            }
+        });
+    }
+
+    @Test
+    void put_execAccessControlError_throwsConnectException() {
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            when(transaction.exec()).thenThrow(new JedisAccessControlException("NOPERM"));
 
             List<SinkRecord> records = List.of(
                     record("team:1", "{\"billed_credits\":1.0,\"expiration\":9999999999}"));
@@ -140,10 +254,10 @@ class RedisSinkTaskTest {
     }
 
     @Test
-    void put_syncDataError_throwsDataException() {
+    void put_execDataError_throwsDataException() {
         withConnectedRedis(mailSender -> {
             stubIncrByFloat(1.0);
-            doThrow(new JedisDataException("ERR value is not a valid float")).when(pipeline).sync();
+            when(transaction.exec()).thenThrow(new JedisDataException("ERR value is not a valid float"));
 
             List<SinkRecord> records = List.of(
                     record("team:1", "{\"billed_credits\":1.0,\"expiration\":9999999999}"));
@@ -152,20 +266,128 @@ class RedisSinkTaskTest {
     }
 
     @Test
-    void put_perCommandErrorSurfacedAtGet_throwsDataException() {
-        // Jedis raises per-command errors (WRONGTYPE, bad float) at Response.get(),
-        // not at sync(). prepareMailRequests reads get() outside its catch so the
-        // error reaches put()'s JedisDataException handler -> DataException.
+    void put_redisLoading_isRetriedWithinMaxRetries() {
+        // Redis was restarted with a restored snapshot and is still loading it.
+        withConnectedRedis(mailSender -> {
+            when(jedis.hgetAll(anyString()))
+                    .thenThrow(new JedisDataException("LOADING Redis is loading the dataset in memory"));
+            List<SinkRecord> batch = List.of(record("team:1", CREDITS_JSON));
+
+            for (int retry = 0; retry < 12; retry++) {
+                assertThrows(RetriableException.class, () -> task.put(batch));
+            }
+            verify(context, times(12)).timeout(5000L);
+            ConnectException givenUp = assertThrows(ConnectException.class, () -> task.put(batch));
+            assertFalse(givenUp instanceof RetriableException);
+        });
+    }
+
+    @Test
+    void put_transactionDiscardedForATransientReason_throwsRetriable() {
+        // A command refused while it was queued: Jedis attaches the refusal to the
+        // EXECABORT error as a suppressed exception.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            JedisDataException aborted = new JedisDataException(
+                    "EXECABORT Transaction discarded because of previous errors.");
+            aborted.addSuppressed(new JedisDataException("OOM command not allowed when used memory > 'maxmemory'."));
+            when(transaction.exec()).thenThrow(aborted);
+
+            assertThrows(RetriableException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON))));
+        });
+    }
+
+    @Test
+    void isTransient_tellsPassingRefusalsFromPermanentOnes() {
+        assertTrue(RedisSinkTask.isTransient(new JedisDataException("READONLY You can't write against a read only replica.")));
+        assertTrue(RedisSinkTask.isTransient(new JedisDataException("MISCONF Redis is configured to save RDB snapshots")));
+        assertTrue(RedisSinkTask.isTransient(new JedisDataException(
+                "EXECABORT Transaction discarded because of: READONLY You can't write against a read only replica.")));
+
+        assertFalse(RedisSinkTask.isTransient(new JedisDataException("WRONGTYPE Operation against a key")));
+        assertFalse(RedisSinkTask.isTransient(new JedisDataException("ERR value is not a valid float")));
+        // No reason given: not known to pass.
+        assertFalse(RedisSinkTask.isTransient(new JedisDataException(
+                "EXECABORT Transaction discarded because of previous errors.")));
+
+        // MULTI was refused but EXEC was not: commands may have run in between.
+        JedisDataException noMulti = new JedisDataException("ERR EXEC without MULTI");
+        noMulti.addSuppressed(new JedisDataException("BUSY Redis is busy running a script"));
+        assertFalse(RedisSinkTask.isTransient(noMulti));
+
+        JedisDataException mixed = new JedisDataException(
+                "EXECABORT Transaction discarded because of previous errors.");
+        mixed.addSuppressed(new JedisDataException("OOM command not allowed"));
+        mixed.addSuppressed(new JedisDataException("ERR wrong number of arguments"));
+        assertFalse(RedisSinkTask.isTransient(mixed));
+    }
+
+    @Test
+    void put_malformedRecordAtOrBelowTheStoredOffset_isNotParsed() {
+        // The way past a record that cannot be parsed: the stored offset was moved
+        // to it by hand. Kafka still delivers it, the consumer group is before it.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            storedOffset(8L);
+
+            assertDoesNotThrow(() -> task.put(List.of(
+                    record("team:1", "this is not json", 8L), record("team:2", CREDITS_JSON, 9L))));
+
+            verify(transaction, times(1)).incrByFloat(eq("team:2"), anyDouble());
+            verify(transaction).hset(OFFSETS_KEY, "0", "9");
+        });
+    }
+
+    @Test
+    void assignedPartition_kafkaDoesNotHaveTheStoredOffset_failsTheTask() {
+        // The hash is from another topic or cluster: offset 5000 is beyond the end of
+        // this partition, so the consumer starts over at the earliest record.
+        withConnectedRedis(mailSender -> {
+            storedOffset(5000L);
+
+            task.open(List.of(PARTITION));
+            task.put(Collections.emptyList());
+            verify(context).offset(PARTITION, 5001L);
+
+            assertThrows(ConnectException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON, 0L))));
+            verify(jedis, never()).multi();
+        });
+    }
+
+    @Test
+    void put_rejectedIncrement_failsTheTaskOnceTheRestOfTheBatchIsNotified() {
+        // Redis does not roll the transaction back: the rejected command's Response
+        // throws at get(), the other record is applied and gets its notification.
         withConnectedRedis(mailSender -> {
             @SuppressWarnings("unchecked")
-            Response<Double> response = mock(Response.class);
-            when(response.get()).thenThrow(new JedisDataException("WRONGTYPE"));
-            when(pipeline.incrByFloat(anyString(), anyDouble())).thenReturn(response);
-            when(pipeline.expireAt(anyString(), anyLong())).thenReturn(mock(Response.class));
+            Response<Double> rejected = mock(Response.class);
+            when(rejected.get()).thenThrow(new JedisDataException("WRONGTYPE"));
+            @SuppressWarnings("unchecked")
+            Response<Double> applied = mock(Response.class);
+            when(applied.get()).thenReturn(55.0);
+            when(transaction.incrByFloat(eq("team:1"), anyDouble())).thenReturn(rejected);
+            when(transaction.incrByFloat(eq("team:2"), anyDouble())).thenReturn(applied);
 
-            List<SinkRecord> records = List.of(
-                    record("team:1", "{\"billed_credits\":1.0,\"expiration\":9999999999}"));
-            assertThrows(DataException.class, () -> task.put(records));
+            String json = "{\"billed_credits\":10.0,\"expiration\":9999999999,\"included_credits\":100,"
+                    + "\"team_billing_email\":\"a@b.c\",\"team_name\":\"Acme\",\"team_plan\":\"Pro\"}";
+            assertThrows(DataException.class,
+                    () -> task.put(List.of(record("team:1", json, 1L), record("team:2", json, 2L))));
+
+            verify(mailSender, times(1)).CreateUsageMailRequest(anyString(), anyString(), any(MailContent.class));
+            verify(mailSender, times(1)).SendUsageMailRequest(any(HttpPost.class));
+        });
+    }
+
+    @Test
+    void put_rejectedExpiration_failsTheTask() {
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            @SuppressWarnings("unchecked")
+            Response<Long> rejected = mock(Response.class);
+            when(rejected.get()).thenThrow(new JedisDataException("ERR invalid expire time in 'expireat' command"));
+            when(transaction.expireAt(anyString(), anyLong())).thenReturn(rejected);
+
+            assertThrows(DataException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON))));
         });
     }
 
@@ -232,6 +454,332 @@ class RedisSinkTaskTest {
             assertDoesNotThrow(() -> task.put(List.of(record("team:1", json))));
 
             verify(mailSender, never()).CreateUsageMailRequest(anyString(), anyString(), any(MailContent.class));
+        });
+    }
+
+    @Test
+    void put_storesOffsetOfLastRecordPerPartitionInTheTransaction() {
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+
+            task.put(List.of(record("team:1", CREDITS_JSON, 7L), record("team:2", CREDITS_JSON, 9L)));
+
+            verify(jedis).watch(OFFSETS_KEY);
+            verify(transaction, times(2)).incrByFloat(anyString(), anyDouble());
+            verify(transaction).hset(OFFSETS_KEY, "0", "9");
+            verify(transaction).exec();
+        });
+    }
+
+    @Test
+    void put_skipsRecordsAtOrBelowTheStoredOffset() {
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            storedOffset(5L);
+
+            task.put(List.of(record("team:1", CREDITS_JSON, 4L), record("team:2", CREDITS_JSON, 5L),
+                    record("team:3", CREDITS_JSON, 6L)));
+
+            verify(transaction, times(1)).incrByFloat(anyString(), anyDouble());
+            verify(transaction).incrByFloat("team:3", 1.0);
+            verify(transaction).hset(OFFSETS_KEY, "0", "6");
+            verify(context, never()).offset(any(TopicPartition.class), anyLong());
+        });
+    }
+
+    @Test
+    void put_allRecordsAlreadyApplied_writesNothingAndSendsNoMail() {
+        withConnectedRedis(mailSender -> {
+            storedOffset(5L);
+
+            String json = "{\"billed_credits\":6000.0,\"expiration\":9999999999,"
+                    + "\"included_credits\":10000,\"credit_cutoff\":0,"
+                    + "\"team_billing_email\":\"team@acme.test\",\"team_name\":\"Acme\","
+                    + "\"team_plan\":\"Pro\"}";
+            task.put(List.of(record("team:1", json, 5L)));
+
+            verify(jedis, never()).multi();
+            verify(jedis).unwatch();
+            verify(mailSender, never()).CreateUsageMailRequest(anyString(), anyString(), any(MailContent.class));
+        });
+    }
+
+    @Test
+    void assignedPartition_isMovedToTheStoredOffsetAndLeftOutOfTheBatch() {
+        // Redis was restored from a snapshot: its counters and offsets are older than
+        // what the consumer group has committed.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            storedOffset(5L);
+
+            task.open(List.of(PARTITION));
+            task.put(List.of(record("team:1", CREDITS_JSON, 9L)));
+
+            verify(context).offset(PARTITION, 6L);
+            verify(jedis, never()).multi();
+
+            // Connect delivers the partition again from the new position.
+            task.put(List.of(record("team:1", CREDITS_JSON, 7L), record("team:1", CREDITS_JSON, 9L)));
+
+            verify(context, times(1)).offset(any(TopicPartition.class), anyLong());
+            verify(transaction, times(2)).incrByFloat("team:1", 1.0);
+            verify(transaction).hset(OFFSETS_KEY, "0", "9");
+        });
+    }
+
+    @Test
+    void assignedPartition_withoutRecords_isMovedToTheStoredOffset() {
+        // The consumer group is at the end of the partition and nothing is produced
+        // to it: no record will ever arrive to trigger the replay.
+        withConnectedRedis(mailSender -> {
+            storedOffset(5L);
+
+            task.open(List.of(PARTITION));
+            task.put(Collections.emptyList());
+
+            verify(context).offset(PARTITION, 6L);
+            verify(jedis, never()).multi();
+
+            task.put(Collections.emptyList());
+            verify(context, times(1)).offset(any(TopicPartition.class), anyLong());
+        });
+    }
+
+    @Test
+    void assignedPartition_withoutStoredOffset_staysWhereTheConsumerGroupHasIt() {
+        // First start with this version, or an empty Redis.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+
+            task.open(List.of(PARTITION));
+            task.put(List.of(record("team:1", CREDITS_JSON, 42L)));
+
+            verify(context, never()).offset(any(TopicPartition.class), anyLong());
+            verify(transaction).hset(OFFSETS_KEY, "0", "42");
+        });
+    }
+
+    @Test
+    void assignedPartition_batchContinuesAfterTheStoredOffset_isNotMoved() {
+        // The usual case: nothing was lost, so nothing has to be read again.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            storedOffset(5L);
+
+            task.open(List.of(PARTITION));
+            task.put(List.of(record("team:1", CREDITS_JSON, 6L), record("team:1", CREDITS_JSON, 7L)));
+
+            verify(context, never()).offset(any(TopicPartition.class), anyLong());
+            verify(transaction, times(2)).incrByFloat("team:1", 1.0);
+            verify(transaction).hset(OFFSETS_KEY, "0", "7");
+        });
+    }
+
+    @Test
+    void assignedPartition_batchOverlapsTheStoredOffset_isNotMovedAndSkipsWhatIsApplied() {
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            storedOffset(5L);
+
+            task.open(List.of(PARTITION));
+            task.put(List.of(record("team:1", CREDITS_JSON, 5L), record("team:1", CREDITS_JSON, 6L)));
+
+            verify(context, never()).offset(any(TopicPartition.class), anyLong());
+            verify(transaction, times(1)).incrByFloat("team:1", 1.0);
+            verify(transaction).hset(OFFSETS_KEY, "0", "6");
+        });
+    }
+
+    @Test
+    void assignedPartition_batchEntirelyApplied_isMovedForwardToTheStoredOffset() {
+        // The consumer group is behind Redis: jump ahead instead of reading through.
+        withConnectedRedis(mailSender -> {
+            storedOffset(5L);
+
+            task.open(List.of(PARTITION));
+            task.put(List.of(record("team:1", CREDITS_JSON, 2L), record("team:1", CREDITS_JSON, 3L)));
+
+            verify(context).offset(PARTITION, 6L);
+            verify(jedis, never()).multi();
+        });
+    }
+
+    @Test
+    void reconnect_afterASeekWasRequested_movesThePartitionAgain() {
+        // The first attempt asks for a seek to 26 and then fails. Connect carries the
+        // seek out anyway. The retry finds a Redis that holds 15: the batch in hand
+        // would continue there, but the consumer is at 26 by now.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            when(context.assignment()).thenReturn(Set.of(PARTITION));
+            storedOffset(25L);
+            when(jedis.unwatch()).thenThrow(new JedisConnectionException("connection reset")).thenReturn("OK");
+
+            List<SinkRecord> batch = List.of(record("team:1", CREDITS_JSON, 10L),
+                    record("team:1", CREDITS_JSON, 20L));
+            task.open(List.of(PARTITION));
+            assertThrows(RetriableException.class, () -> task.put(batch));
+            verify(context).offset(PARTITION, 26L);
+
+            storedOffset(15L);
+            task.put(batch);
+
+            verify(context).offset(PARTITION, 16L);
+            verify(transaction, never()).incrByFloat(anyString(), anyDouble());
+        });
+    }
+
+    @Test
+    void reconnect_nothingLost_theBatchIsAppliedWithoutReadingItAgain() {
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            when(context.assignment()).thenReturn(Set.of(PARTITION));
+            storedOffset(8L);
+            when(transaction.exec()).thenThrow(new JedisConnectionException("connection reset"))
+                    .thenReturn(List.of());
+
+            List<SinkRecord> batch = List.of(record("team:1", CREDITS_JSON, 9L));
+            assertThrows(RetriableException.class, () -> task.put(batch));
+            task.put(batch);
+
+            verify(context, never()).offset(any(TopicPartition.class), anyLong());
+            verify(transaction, times(2)).incrByFloat(anyString(), anyDouble());
+            verify(transaction, times(2)).hset(OFFSETS_KEY, "0", "9");
+        });
+    }
+
+    @Test
+    void assignedPartition_staysLeftOutWhenTheBatchIsRetried() {
+        // Partition 0 is moved back, partition 1 is written and that fails. Connect
+        // delivers the same batch again: applying partition 0's records now would
+        // store an offset beyond the records still to be replayed.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            storedOffset(5L);
+            when(transaction.exec()).thenReturn(null).thenReturn(List.of());
+
+            List<SinkRecord> batch = List.of(record("team:1", CREDITS_JSON, 9L),
+                    new SinkRecord("usage", 1, null, "team:2", null, CREDITS_JSON, 3L));
+
+            task.open(List.of(PARTITION, new TopicPartition("usage", 1)));
+            assertThrows(RetriableException.class, () -> task.put(batch));
+            task.put(batch);
+
+            verify(transaction, never()).incrByFloat(eq("team:1"), anyDouble());
+            verify(transaction, never()).hset(OFFSETS_KEY, "0", "9");
+            verify(transaction, times(2)).hset(OFFSETS_KEY, "1", "3");
+
+            // After the seek, the partition is delivered from the stored offset.
+            task.put(List.of(record("team:1", CREDITS_JSON, 7L), record("team:1", CREDITS_JSON, 9L)));
+            verify(transaction, times(2)).incrByFloat("team:1", 1.0);
+            verify(transaction).hset(OFFSETS_KEY, "0", "9");
+        });
+    }
+
+    @Test
+    void assignedPartition_redisUnavailable_isMovedOnTheRetry() {
+        withConnectedRedis(mailSender -> {
+            Map<String, String> offsets = new HashMap<>();
+            offsets.put("0", "5");
+            when(jedis.hgetAll(OFFSETS_KEY)).thenThrow(new JedisConnectionException("down")).thenReturn(offsets);
+
+            task.open(List.of(PARTITION));
+            assertThrows(RetriableException.class, () -> task.put(Collections.emptyList()));
+            verify(context, never()).offset(any(TopicPartition.class), anyLong());
+
+            task.put(Collections.emptyList());
+            verify(context).offset(PARTITION, 6L);
+        });
+    }
+
+    @Test
+    void reconnect_movesTheAssignedPartitionsToTheOffsetsOfTheNewRedis() {
+        // A failover promoted a replica that is behind: offset 8 was stored on the
+        // old master, the new one holds 5.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            when(context.assignment()).thenReturn(Set.of(PARTITION));
+            storedOffset(8L);
+            when(transaction.exec()).thenThrow(new JedisConnectionException("connection reset"))
+                    .thenReturn(List.of());
+
+            List<SinkRecord> batch = List.of(record("team:1", CREDITS_JSON, 9L));
+            assertThrows(RetriableException.class, () -> task.put(batch));
+            verify(context, never()).offset(any(TopicPartition.class), anyLong());
+
+            storedOffset(5L);
+            task.put(batch);
+
+            // Replayed from offset 6; the batch in hand is left out and read again.
+            verify(context).offset(PARTITION, 6L);
+            verify(transaction, times(1)).incrByFloat(anyString(), anyDouble());
+        });
+    }
+
+    @Test
+    void open_movesAReassignedPartitionAgain() {
+        withConnectedRedis(mailSender -> {
+            storedOffset(5L);
+
+            task.open(List.of(PARTITION));
+            task.put(Collections.emptyList());
+            task.close(List.of(PARTITION));
+            task.open(List.of(PARTITION));
+            task.put(Collections.emptyList());
+
+            verify(context, times(2)).offset(PARTITION, 6L);
+        });
+    }
+
+    @Test
+    void put_usesTheCoordinatesTheRecordWasReadFrom() {
+        // A transformation renamed the topic; the offset belongs to the source topic.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            SinkRecord read = record("team:1", CREDITS_JSON, 7L);
+            SinkRecord routed = read.newRecord("renamed", 3, null, "team:1", null, CREDITS_JSON, null);
+
+            task.put(List.of(routed));
+
+            verify(jedis).watch(OFFSETS_KEY);
+            verify(transaction).hset(OFFSETS_KEY, "0", "7");
+        });
+    }
+
+    @Test
+    void put_offsetsNotStored_throwsDataException() {
+        // The increments are applied; without the offsets they would be counted again.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            @SuppressWarnings("unchecked")
+            Response<Long> rejected = mock(Response.class);
+            when(rejected.get()).thenThrow(new JedisDataException("WRONGTYPE"));
+            when(transaction.hset(anyString(), anyString(), anyString())).thenReturn(rejected);
+
+            assertThrows(DataException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON))));
+        });
+    }
+
+    @Test
+    void put_offsetsChangedConcurrently_throwsRetriable() {
+        // EXEC returns null when a WATCHed key was modified: nothing was applied.
+        withConnectedRedis(mailSender -> {
+            stubIncrByFloat(1.0);
+            when(transaction.exec()).thenReturn(null);
+
+            assertThrows(RetriableException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON))));
+            verify(context).timeout(1000L);
+        });
+    }
+
+    @Test
+    void put_invalidStoredOffset_throwsDataException() {
+        withConnectedRedis(mailSender -> {
+            Map<String, String> offsets = new HashMap<>();
+            offsets.put("0", "not-a-number");
+            when(jedis.hgetAll(OFFSETS_KEY)).thenReturn(offsets);
+
+            assertThrows(DataException.class, () -> task.put(List.of(record("team:1", CREDITS_JSON))));
         });
     }
 

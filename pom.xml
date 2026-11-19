@@ -6,7 +6,7 @@
 
   <groupId>com.pinax.kafka.redis.connect.sink</groupId>
   <artifactId>pinax-redis-kafka-connect</artifactId>
-  <version>0.3.0</version>
+  <version>0.4.0</version>
 
   <name>pinax-redis-kafka-connect</name>
 
@@ -19,7 +19,7 @@
     <!-- Test stack -->
     <junit.jupiter.version>5.11.4</junit.jupiter.version>
     <mockito.version>5.14.2</mockito.version>
-    <testcontainers.version>1.20.4</testcontainers.version>
+    <testcontainers.version>1.21.4</testcontainers.version>
 
     <!-- Static analysis -->
     <spotbugs.plugin.version>4.8.6.6</spotbugs.plugin.version>
@@ -102,6 +102,14 @@
   </dependencies>
 
   <build>
+    <!-- Filtered so the connector can report ${project.version} as its version. -->
+    <resources>
+      <resource>
+        <directory>src/main/resources</directory>
+        <filtering>true</filtering>
+      </resource>
+    </resources>
+
     <plugins>
       <plugin>
         <artifactId>maven-clean-plugin</artifactId>

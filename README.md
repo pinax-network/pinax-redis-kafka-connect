@@ -13,8 +13,10 @@ For each Kafka record it:
 2. **Notifies** the team by email (via Mandrill / Mailchimp Transactional) the first
    time their accumulated usage crosses a milestone of their included allowance.
 
-Writes are issued through a single Redis [pipeline](https://redis.io/docs/latest/develop/use/pipelining/)
-per batch and committed with one `SYNC`.
+Each batch is written as one Redis [transaction](https://redis.io/docs/latest/develop/interact/transactions/)
+(`MULTI`/`EXEC`), which also stores the Kafka offset of the last record applied per
+partition. A record is therefore counted exactly once, and a Redis snapshot knows where
+in the topic it ends.
 
 ---
 
@@ -59,12 +61,19 @@ and restart the worker.
 |-------------------|----------|----------------------|-----------------------------------------------------------------|
 | `master`          | no       | `mymaster`           | Redis Sentinel master name.                                     |
 | `hosts`           | no       | `localhost:6379`     | Comma-separated list of Sentinel `host:port` addresses.         |
+| `offsetsKey`      | no       | `kafka-connect:redis-sink:offsets` | Prefix of the hashes holding the applied offsets, one per topic (`<offsetsKey>:<topic>`). |
+| `retryBackoffMs`  | no       | `5000`               | Milliseconds before a batch is retried after Redis was unreachable or not accepting writes. |
+| `conflictRetryBackoffMs` | no | `1000`              | Milliseconds before a batch is retried after its transaction was refused because the stored offsets changed. |
+| `maxRetries`      | no       | `12`                 | How often in a row a batch is retried before the task fails. About a minute with the default backoff. |
 | `from`            | no       | `info@pinax.network` | `From` address for notification emails (must be a valid email). |
 | `mailchimpApiKey` | **yes**  | —                    | Mandrill / Mailchimp Transactional API key.                     |
 | `templateSlug`    | **yes**  | —                    | Mandrill template name used to render the usage email.          |
 
-Plus the standard Kafka Connect sink properties (`topics`, `tasks.max`, converters,
-`errors.*`, …).
+Needs a Kafka Connect worker of version 3.6 or later.
+
+Plus the standard Kafka Connect sink properties (`topics`, converters, `errors.*`, …).
+`tasks.max` must be `1`: a config with a higher value is rejected, see "A single task"
+below.
 
 ### Example connector configuration
 
@@ -127,18 +136,103 @@ multiples of the allowance. If a single batch leaps past several at once, only t
 
 ## Behaviour & delivery semantics
 
-- **At-least-once.** On a retryable failure Connect re-delivers the batch. The
-  `INCRBYFLOAT` increment is **not** idempotent, so a retry may count some credits more
-  than once. This is accepted in exchange for **never missing a usage notification** —
-  notifications are sent after each successful write.
+- **Counters are exactly-once.** Every batch is one `MULTI`/`EXEC` transaction that
+  applies the `INCRBYFLOAT` increments and stores, in the hash `<offsetsKey>:<topic>`,
+  the offset of the last record applied per partition (field = partition). Before a
+  batch is written, records at or below the stored offset are dropped: a batch that
+  Connect delivers again after a failure, a restart or a rewind of the consumer group
+  is not counted twice, and its notifications are not sent twice.
+- **Notifications are at-most-once.** A milestone is detected from the result of the
+  transaction and its email is sent right after it. When the transaction is applied but
+  the task does not get to send (the reply from Redis is lost, the worker stops, or the
+  mail API call fails), the batch is skipped as already counted when it arrives again
+  and that email is never sent. The team is notified again at the next milestone.
+- **Redis decides where a partition continues.** When a partition is assigned, the
+  task moves the consumer to the record after the stored offset, whatever the consumer
+  group has committed. It does so on the next `put()`, which Connect also calls without
+  records, so a partition nothing is produced to is covered too. A partition whose
+  batch in hand already continues right after the stored offset is left where it is;
+  otherwise its records in hand are left out and arrive again from the new position. A
+  partition without a stored offset stays where the consumer group has it.
+  The same is done for all assigned partitions whenever the task reconnects to Redis:
+  after a Sentinel failover the new master may lack the last writes, and it then
+  continues from the offsets it holds.
+- **Transformations.** Offsets are stored and compared by the topic, partition and
+  offset a record was read from, so a transformation that renames the topic does not
+  affect them. The hash is named after the source topic.
+- **Restoring Redis.** Because counters and offsets are written together, a snapshot
+  (RDB or AOF) is consistent by itself. Stop the connector, restore the snapshot, start
+  the connector: it continues at the offsets in the snapshot and re-applies what came
+  after it. Things to know:
+  - The topic must still hold those records. If retention has removed them, the
+    consumer continues at the earliest record left and the removed ones stay uncounted.
+  - Re-applied records that cross a milestone send their notification again.
+  - A Redis without the offset hash (empty, or last written by a version before 0.4.0)
+    follows the consumer group as before. To rebuild the counters from the topic, delete
+    them and reset the consumer group's offsets.
+  - A partition gets its entry in the hash with the first record applied by 0.4.0 or
+    later. A snapshot taken before that restores the partition to wherever the consumer
+    group is, and its records since the snapshot are not applied again. Check with
+    `HGETALL <offsetsKey>:<topic>` that every partition is listed; the task warns when
+    it is assigned a partition that is missing from an existing hash.
+  - **Rolling back.** A version before 0.4.0 counts records without updating the offset
+    hash. After running one, delete `<offsetsKey>:<topic>` before starting 0.4.0 or later
+    again. Otherwise the task goes back to the stale offsets and everything the old
+    version counted is counted a second time. The task cannot tell this from a restored
+    snapshot; it logs a warning with the number of records whenever it moves a partition
+    back behind the batch in hand.
+  - The offsets belong to one Kafka cluster. When the connector is pointed at another
+    cluster or a re-created topic, delete `<offsetsKey>:<topic>` first. The task fails
+    when it notices: it moves a partition to a stored offset the topic does not have,
+    and Kafka starts the consumer over. A stored offset the new topic does have cannot
+    be told apart and is applied to it.
+- **A single task.** The offsets of all partitions of a topic are in one hash, and every
+  transaction `WATCH`es it, so tasks running side by side would refuse each other's
+  transactions. The connector therefore always creates one task. A config with
+  `tasks.max` higher than 1 is rejected when it is submitted; one stored before that is
+  brought down to one task, with a warning in the log. The `WATCH` remains for a task that was replaced but has
+  not noticed yet: when it stored offsets in between, the transaction is refused,
+  nothing is applied and the batch is retried after `conflictRetryBackoffMs`.
+- **Retries.** A batch that failed for a passing reason is delivered again by Connect
+  after `retryBackoffMs` (Redis unreachable, or not accepting writes: `LOADING`, `BUSY`,
+  `READONLY`, `MISCONF`, `OOM`) or
+  `conflictRetryBackoffMs` (transaction refused). Connect would do so forever, with the
+  task `RUNNING` while nothing is counted. After `maxRetries` retries in a row without a
+  batch going through, the task fails instead, which shows in its status and leaves it
+  to whatever restarts failed tasks.
+- **Not rolled back.** Redis does not undo a transaction when it rejects one of its
+  commands: the rest of the batch and the offsets are applied.
+  - A rejected increment or expiration (`WRONGTYPE`, "not a valid float", "invalid expire
+    time") concerns a single record. It is logged as an error with the key, topic,
+    partition and offset. The notifications of the other records are sent, then the
+    task fails with a `DataException`. After a restart it continues behind that batch;
+    the rejected increment or expiration is lost.
+  - Offsets that could not be stored fail the task with a `DataException`: carrying on
+    would count the batch again after the next restart.
+- **Invalid records fail the task.** A record whose value is not JSON or lacks
+  `billed_credits` or `expiration` fails the task with a `DataException`. The records
+  before it in its partition, and those of other partitions, are applied first, so the
+  stored offset ends up right before it. The task fails on the same record again after
+  a restart, until the partition is moved to the record by hand (below): records at or
+  below the stored offset are not parsed, and nothing else is skipped.
+- **Moving a partition by hand.** Resetting the consumer group has no effect on a
+  partition with a stored offset. To skip or repeat records, stop the connector, set the
+  offset of the last record to treat as applied with
+  `HSET <offsetsKey>:<topic> <partition> <offset>`, and start it again. Stop it, do not
+  pause it: a task that keeps running reads the stored offsets only for records it is
+  delivered, does not move its consumer, and overwrites the offset with its next batch.
 - **Error classification** (`put()` maps Redis failures to the right Connect signal):
 
   | Failure | Mapped to | Effect |
   |---|---|---|
-  | Connection loss, pool exhaustion, sentinel failover (`JedisException`) | `RetriableException` | Connect retries the batch |
+  | Connection loss, pool exhaustion, sentinel failover (`JedisException`) | `RetriableException` | Connect retries the batch; the task fails after `maxRetries` in a row |
+  | Offsets changed by another task between `WATCH` and `EXEC` | `RetriableException` | Connect retries the batch; the task fails after `maxRetries` in a row |
   | Auth / ACL error (`JedisAccessControlException`) | `ConnectException` | Task fails fast (permanent misconfig) |
-  | Command/data error — `WRONGTYPE`, "not a valid float" (`JedisDataException`) | `DataException` | Non-retriable (retrying can't help) |
-  | Malformed record payload (`JSONException`) | `DataException` | Non-retriable |
+  | Redis temporarily not accepting writes — `LOADING`, `BUSY`, `READONLY`, `MISCONF`, `OOM`, `NOREPLICAS`, also as the reason of an `EXECABORT` | `RetriableException` | Nothing was applied; Connect retries the batch on a new connection; the task fails after `maxRetries` in a row |
+  | Kafka does not have the offset stored in Redis | `ConnectException` | Task fails before anything is written; the offset hash belongs to another topic or cluster |
+  | Increment or expiration of one record rejected inside the transaction | `DataException` | Logged; the rest of the batch is applied and notified, then the task fails |
+  | Offsets rejected inside the transaction, or another permanent error on the offset hash (`JedisDataException`) | `DataException` | Non-retriable (retrying can't help) |
+  | Record value that cannot be parsed (`JSONException`) | `DataException` | Non-retriable; the records before it are applied, then the task fails |
 
 - **Connection lifecycle.** A failed batch drops and rebuilds the Redis connection on
   the next `put()`; a transient outage at startup is tolerated and retried lazily.
@@ -159,9 +253,11 @@ mvn verify
   the connector wiring, mail-content rendering, and `RedisSinkTask`'s error
   classification and notification logic (Redis and the mailer are mocked).
 - **Integration tests** (`*IT`, Failsafe) — JUnit 5 + [Testcontainers](https://testcontainers.com/).
-  Start a real Redis container and verify the pipeline semantics the task relies on
-  (accumulation, TTL, and that per-command errors surface at `Response.get()`). They
-  **self-skip** when no Docker daemon is available.
+  Start a real Redis container and verify the transaction semantics the task relies on
+  (accumulation, TTL, stored offsets, a refused transaction after a concurrent offset
+  change, and that per-command errors surface at `Response.get()`). They
+  **self-skip** when no Docker daemon is available, except in CI (`CI` set in the
+  environment), where a missing daemon fails the build.
 
 ## Static analysis
 
