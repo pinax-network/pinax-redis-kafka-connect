@@ -6,7 +6,7 @@
 
   <groupId>com.pinax.kafka.redis.connect.sink</groupId>
   <artifactId>pinax-redis-kafka-connect</artifactId>
-  <version>0.4.0</version>
+  <version>0.5.0</version>
 
   <name>pinax-redis-kafka-connect</name>
 

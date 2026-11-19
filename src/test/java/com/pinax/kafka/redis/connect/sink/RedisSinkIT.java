@@ -9,7 +9,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.time.Instant;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -19,9 +21,11 @@ import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.utility.DockerImageName;
 
+import redis.clients.jedis.HostAndPort;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.Response;
 import redis.clients.jedis.Transaction;
+import redis.clients.jedis.exceptions.JedisAccessControlException;
 import redis.clients.jedis.exceptions.JedisDataException;
 
 /**
@@ -66,6 +70,59 @@ class RedisSinkIT {
         }
         if (redis != null) {
             redis.stop();
+        }
+    }
+
+    @Test
+    void clientConfigAuthenticatesAgainstARedisThatRequiresAPassword() {
+        try (GenericContainer<?> protectedRedis = new GenericContainer<>(DockerImageName.parse("redis:7-alpine"))
+                .withCommand("redis-server", "--requirepass", "s3cret")
+                .withExposedPorts(6379)
+                .waitingFor(Wait.forListeningPort())) {
+            protectedRedis.start();
+            HostAndPort address = new HostAndPort(protectedRedis.getHost(), protectedRedis.getMappedPort(6379));
+
+            // A password without a user authenticates as the default user.
+            try (Jedis authenticated = new Jedis(address, RedisSinkTask.clientConfig("", "s3cret"))) {
+                assertEquals("PONG", authenticated.ping());
+            }
+            try (Jedis authenticated = new Jedis(address, RedisSinkTask.clientConfig("default", "s3cret"))) {
+                assertEquals("PONG", authenticated.ping());
+            }
+            // No password: no authentication is attempted, and Redis refuses commands.
+            try (Jedis anonymous = new Jedis(address, RedisSinkTask.clientConfig("", ""))) {
+                assertThrows(JedisDataException.class, anonymous::ping);
+            }
+            // A wrong password is the permanent error the task fails fast on.
+            assertThrows(JedisAccessControlException.class, () -> {
+                try (Jedis wrong = new Jedis(address, RedisSinkTask.clientConfig("", "wrong"))) {
+                    wrong.ping();
+                }
+            });
+        }
+    }
+
+    @Test
+    void sentinelCredentialsCheckFailsOnRefusedCredentialsAndSkipsUnreachableSentinels() {
+        // A Redis with requirepass stands in for a Sentinel: the check only
+        // authenticates and pings, which a Sentinel answers the same way.
+        try (GenericContainer<?> protectedSentinel = new GenericContainer<>(DockerImageName.parse("redis:7-alpine"))
+                .withCommand("redis-server", "--requirepass", "s3cret")
+                .withExposedPorts(6379)
+                .waitingFor(Wait.forListeningPort())) {
+            protectedSentinel.start();
+            HostAndPort reachable = new HostAndPort(protectedSentinel.getHost(), protectedSentinel.getMappedPort(6379));
+            // Nothing listens there; connecting is refused at once.
+            HostAndPort unreachable = new HostAndPort("127.0.0.1", 1);
+            Set<HostAndPort> sentinels = new LinkedHashSet<HostAndPort>(List.of(unreachable, reachable));
+
+            RedisSinkTask.checkSentinelCredentials(sentinels, RedisSinkTask.clientConfig("", "s3cret"));
+            assertThrows(JedisAccessControlException.class,
+                    () -> RedisSinkTask.checkSentinelCredentials(sentinels, RedisSinkTask.clientConfig("", "wrong")));
+            assertThrows(JedisAccessControlException.class,
+                    () -> RedisSinkTask.checkSentinelCredentials(sentinels, RedisSinkTask.clientConfig("", "")));
+            // No Sentinel answers: left to the pool, which reports the outage.
+            RedisSinkTask.checkSentinelCredentials(Set.of(unreachable), RedisSinkTask.clientConfig("", "wrong"));
         }
     }
 

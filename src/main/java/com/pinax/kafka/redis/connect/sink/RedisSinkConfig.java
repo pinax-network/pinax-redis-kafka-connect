@@ -1,5 +1,8 @@
 package com.pinax.kafka.redis.connect.sink;
 
+import java.util.Map;
+import java.util.TreeMap;
+
 import org.apache.kafka.common.config.ConfigDef;
 
 public class RedisSinkConfig {
@@ -7,6 +10,10 @@ public class RedisSinkConfig {
         // Redis sink configuration
         public static final String MASTER = "master";
         public static final String HOSTS = "hosts";
+        public static final String USERNAME = "redis_username";
+        public static final String PASSWORD = "redis_password";
+        public static final String SENTINEL_USERNAME = "redis_sentinel_username";
+        public static final String SENTINEL_PASSWORD = "redis_sentinel_password";
         public static final String OFFSETS_KEY = "offsetsKey";
         public static final String RETRY_BACKOFF_MS = "retryBackoffMs";
         public static final String CONFLICT_RETRY_BACKOFF_MS = "conflictRetryBackoffMs";
@@ -29,6 +36,29 @@ public class RedisSinkConfig {
                                         new RedisSinkConfigValidator(),
                                         ConfigDef.Importance.HIGH,
                                         "Redis hosts")
+                        .define(USERNAME,
+                                        ConfigDef.Type.STRING,
+                                        "",
+                                        ConfigDef.Importance.MEDIUM,
+                                        "User to authenticate as on the Redis nodes. Empty with a password "
+                                                        + "set: the default user")
+                        .define(PASSWORD,
+                                        ConfigDef.Type.PASSWORD,
+                                        "",
+                                        ConfigDef.Importance.MEDIUM,
+                                        "Password for the Redis nodes. Empty: no authentication")
+                        .define(SENTINEL_USERNAME,
+                                        ConfigDef.Type.STRING,
+                                        "",
+                                        ConfigDef.Importance.MEDIUM,
+                                        "User to authenticate as on the Sentinels. Empty with a password "
+                                                        + "set: the default user")
+                        .define(SENTINEL_PASSWORD,
+                                        ConfigDef.Type.PASSWORD,
+                                        "",
+                                        ConfigDef.Importance.MEDIUM,
+                                        "Password for the Sentinels, which authenticate separately from the "
+                                                        + "Redis nodes. Empty: no authentication")
                         .define(OFFSETS_KEY,
                                         ConfigDef.Type.STRING,
                                         "kafka-connect:redis-sink:offsets",
@@ -67,11 +97,25 @@ public class RedisSinkConfig {
                                         ConfigDef.Importance.HIGH,
                                         "Address used to send usage notification emails")
                         .define(MAILCHIMP_API_KEY,
-                                        ConfigDef.Type.STRING,
+                                        ConfigDef.Type.PASSWORD,
                                         ConfigDef.Importance.HIGH,
                                         "Mailchimp API key")
                         .define(TEMPLATE_SLUG,
                                         ConfigDef.Type.STRING,
                                         ConfigDef.Importance.HIGH,
                                         "Mailchimp template slug");
+
+        /**
+         * The settings as they may be logged: Connect hands the connector and the
+         * task the resolved values, secrets included.
+         */
+        public static Map<String, String> withoutSecrets(Map<String, String> properties) {
+                Map<String, String> loggable = new TreeMap<String, String>(properties);
+                for (ConfigDef.ConfigKey key : CONFIG_DEF.configKeys().values()) {
+                        if (key.type == ConfigDef.Type.PASSWORD && loggable.containsKey(key.name)) {
+                                loggable.put(key.name, "[hidden]");
+                        }
+                }
+                return loggable;
+        }
 }

@@ -61,6 +61,10 @@ and restart the worker.
 |-------------------|----------|----------------------|-----------------------------------------------------------------|
 | `master`          | no       | `mymaster`           | Redis Sentinel master name.                                     |
 | `hosts`           | no       | `localhost:6379`     | Comma-separated list of Sentinel `host:port` addresses.         |
+| `redis_username`  | no       | —                    | User to authenticate as on the Redis nodes. Empty with a `redis_password` set: the `default` user. |
+| `redis_password`  | no       | —                    | Password for the Redis nodes. Empty: no authentication.         |
+| `redis_sentinel_username` | no | —                  | User to authenticate as on the Sentinels. Empty with a `redis_sentinel_password` set: the `default` user. |
+| `redis_sentinel_password` | no | —                    | Password for the Sentinels. They authenticate separately from the Redis nodes, so set it also when it is the same password. Empty: no authentication. |
 | `offsetsKey`      | no       | `kafka-connect:redis-sink:offsets` | Prefix of the hashes holding the applied offsets, one per topic (`<offsetsKey>:<topic>`). |
 | `retryBackoffMs`  | no       | `5000`               | Milliseconds before a batch is retried after Redis was unreachable or not accepting writes. |
 | `conflictRetryBackoffMs` | no | `1000`              | Milliseconds before a batch is retried after its transaction was refused because the stored offsets changed. |
@@ -88,12 +92,23 @@ below.
     "hosts": "sentinel-a:26379,sentinel-b:26379,sentinel-c:26379",
     "from": "billing@pinax.network",
     "mailchimpApiKey": "${file:/secrets/mandrill.properties:apiKey}",
+    "redis_password": "${file:/secrets/redis.properties:password}",
+    "redis_sentinel_password": "${file:/secrets/redis.properties:sentinelPassword}",
     "templateSlug": "monthly-usage-update",
     "key.converter": "org.apache.kafka.connect.storage.StringConverter",
     "value.converter": "org.apache.kafka.connect.storage.StringConverter"
   }
 }
 ```
+
+Give the secrets (`mailchimpApiKey`, `redis_password`, `redis_sentinel_password`) as
+[ConfigProvider](https://kafka.apache.org/documentation/#config_providers) references,
+as above, not as literal values. The connector keeps them out of its log, but Connect
+stores the configuration as submitted and returns it as is from
+`GET /connectors/{name}/config`: a literal secret can be read back there, a reference
+resolves only inside the worker. The `file` provider has to be enabled on the worker
+(`config.providers=file` and
+`config.providers.file.class=org.apache.kafka.common.config.provider.FileConfigProvider`).
 
 ## Record format
 
