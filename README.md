@@ -24,7 +24,7 @@ in the topic it ends.
 
 |                   |                                                                               |
 |-------------------|-------------------------------------------------------------------------------|
-| **Java**          | 17+ (the connector and its `connect-api` dependency are compiled for Java 17) |
+| **Java**          | 17+ to run (the connector and its `connect-api` dependency are compiled for Java 17); JDK 21+ to build |
 | **Kafka Connect** | 4.x runtime                                                                   |
 | **Redis**         | Reached via **Redis Sentinel** (the connector uses `JedisSentinelPool`)       |
 | **Docker**        | Only for running the integration tests locally                                |
@@ -249,10 +249,10 @@ mvn test
 mvn verify
 ```
 
-- **Unit tests** (`*Test`, Surefire) — JUnit 5 + Mockito. Cover config validation,
+- **Unit tests** (`*Test`, Surefire) — JUnit 6 + Mockito. Cover config validation,
   the connector wiring, mail-content rendering, and `RedisSinkTask`'s error
   classification and notification logic (Redis and the mailer are mocked).
-- **Integration tests** (`*IT`, Failsafe) — JUnit 5 + [Testcontainers](https://testcontainers.com/).
+- **Integration tests** (`*IT`, Failsafe) — JUnit 6 + [Testcontainers](https://testcontainers.com/).
   Start a real Redis container and verify the transaction semantics the task relies on
   (accumulation, TTL, stored offsets, a refused transaction after a concurrent offset
   change, and that per-command errors surface at `Response.get()`). They
