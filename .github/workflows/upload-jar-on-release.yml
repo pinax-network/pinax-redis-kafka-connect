@@ -4,9 +4,6 @@ on:
   release:
     types: [created]
 
-env:
-  PINAX_CONNECT_REPO: pinax-network/pinax-connect
-
 jobs:
   build-and-upload:
     runs-on: ubuntu-latest
@@ -19,10 +16,6 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '21'
-      
-      - name: Set short sha
-        id: vars
-        run: echo "sha_short=$(git rev-parse --short ${{ github.sha }})" >> $GITHUB_OUTPUT
 
       - name: Build the project
         run: mvn clean package
@@ -32,11 +25,3 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload ${{ github.event.release.tag_name }} target/pinax-redis-kafka-connect.jar
-      
-      - name: Dispatch build event
-        uses: peter-evans/repository-dispatch@v4
-        with:
-          token: ${{ secrets.PAT }}
-          repository: ${{ env.PINAX_CONNECT_REPO }}
-          event-type: build-push-image
-          client-payload: '{"tag": "${{ github.event.release.tag_name }}", "sha_short": "${{ steps.vars.outputs.sha_short }}"}'
