@@ -34,7 +34,7 @@ public class RedisSinkConnector extends SinkConnector {
 
     @Override
     public void start(Map<String, String> configMap) {
-        logger.info("Starting connector {}", configMap);
+        logger.info("Starting connector {}", RedisSinkConfig.withoutSecrets(configMap));
 
         // A config stored before validate() rejected it. Not failed here: Connect
         // would keep running the tasks it created earlier. taskConfigs() brings them

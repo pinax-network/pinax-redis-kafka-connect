@@ -43,6 +43,34 @@ class RedisSinkConfigTest {
     }
 
     @Test
+    void credentialsAreEmptyByDefault() {
+        AbstractConfig config = new AbstractConfig(RedisSinkConfig.CONFIG_DEF, minimalProps());
+
+        assertEquals("", config.getString(RedisSinkConfig.USERNAME));
+        assertEquals("", config.getPassword(RedisSinkConfig.PASSWORD).value());
+        assertEquals("", config.getString(RedisSinkConfig.SENTINEL_USERNAME));
+        assertEquals("", config.getPassword(RedisSinkConfig.SENTINEL_PASSWORD).value());
+    }
+
+    @Test
+    void withoutSecrets_hidesPasswordsAndTheApiKey() {
+        Map<String, String> props = minimalProps();
+        props.put(RedisSinkConfig.PASSWORD, "redis-secret");
+        props.put(RedisSinkConfig.SENTINEL_PASSWORD, "sentinel-secret");
+        props.put(RedisSinkConfig.USERNAME, "sink");
+
+        Map<String, String> loggable = RedisSinkConfig.withoutSecrets(props);
+
+        assertEquals("[hidden]", loggable.get(RedisSinkConfig.PASSWORD));
+        assertEquals("[hidden]", loggable.get(RedisSinkConfig.SENTINEL_PASSWORD));
+        assertEquals("[hidden]", loggable.get(RedisSinkConfig.MAILCHIMP_API_KEY));
+        assertEquals("sink", loggable.get(RedisSinkConfig.USERNAME));
+        assertEquals("usage-template", loggable.get(RedisSinkConfig.TEMPLATE_SLUG));
+        // The caller's map is left alone.
+        assertEquals("redis-secret", props.get(RedisSinkConfig.PASSWORD));
+    }
+
+    @Test
     void mailchimpApiKey_isRequired() {
         Map<String, String> props = minimalProps();
         props.remove(RedisSinkConfig.MAILCHIMP_API_KEY);

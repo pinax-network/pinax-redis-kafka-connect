@@ -26,7 +26,10 @@ import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import redis.clients.jedis.DefaultJedisClientConfig;
+import redis.clients.jedis.HostAndPort;
 import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisClientConfig;
 import redis.clients.jedis.JedisSentinelPool;
 import redis.clients.jedis.Transaction;
 import redis.clients.jedis.exceptions.JedisAccessControlException;
@@ -37,7 +40,9 @@ import redis.clients.jedis.Response;
 public class RedisSinkTask extends SinkTask {
     private final Logger logger = LoggerFactory.getLogger(RedisSinkConnector.class);
 
-    private Set<String> sentinels = new HashSet<String>();
+    private Set<HostAndPort> sentinels = new HashSet<HostAndPort>();
+    private JedisClientConfig redisClientConfig;
+    private JedisClientConfig sentinelClientConfig;
 
     private JedisSentinelPool jedisSentinelPool = null;
     private Jedis jedis = null;
@@ -77,10 +82,26 @@ public class RedisSinkTask extends SinkTask {
         // Let connection failures propagate. Callers decide how to react: startup
         // tolerates them (put() retries lazily) and put() maps them to a
         // RetriableException so Kafka Connect re-delivers the batch.
-        jedisSentinelPool = new JedisSentinelPool(redisMaster, sentinels);
+        jedisSentinelPool = new JedisSentinelPool(redisMaster, sentinels, redisClientConfig, sentinelClientConfig);
         jedis = jedisSentinelPool.getResource();
 
         logger.info("Redis connection created");
+    }
+
+    /**
+     * The settings for connecting to a Redis node or a Sentinel. Without a password
+     * no authentication is attempted; a password without a user authenticates as the
+     * default user.
+     */
+    static JedisClientConfig clientConfig(String username, String password) {
+        DefaultJedisClientConfig.Builder builder = DefaultJedisClientConfig.builder();
+        if (password != null && !password.isEmpty()) {
+            builder.password(password);
+            if (username != null && !username.isEmpty()) {
+                builder.user(username);
+            }
+        }
+        return builder.build();
     }
 
     private void closeRedisConnection() {
@@ -106,7 +127,7 @@ public class RedisSinkTask extends SinkTask {
 
     @Override
     public void start(Map<String, String> properties) {
-        logger.info("Starting Redis sink task {}", properties);
+        logger.info("Starting Redis sink task {}", RedisSinkConfig.withoutSecrets(properties));
 
         AbstractConfig config = new AbstractConfig(RedisSinkConfig.CONFIG_DEF, properties);
 
@@ -125,12 +146,17 @@ public class RedisSinkTask extends SinkTask {
         // Prepare email sender
         mailSender = new MailSender(
                 config.getString(RedisSinkConfig.FROM),
-                config.getString(RedisSinkConfig.MAILCHIMP_API_KEY),
+                config.getPassword(RedisSinkConfig.MAILCHIMP_API_KEY).value(),
                 config.getString(RedisSinkConfig.TEMPLATE_SLUG));
 
         for (String redisHostPort : redisHosts) {
-            sentinels.add(redisHostPort);
+            sentinels.add(HostAndPort.from(redisHostPort));
         }
+        // The Sentinels authenticate separately from the Redis nodes.
+        redisClientConfig = clientConfig(config.getString(RedisSinkConfig.USERNAME),
+                config.getPassword(RedisSinkConfig.PASSWORD).value());
+        sentinelClientConfig = clientConfig(config.getString(RedisSinkConfig.SENTINEL_USERNAME),
+                config.getPassword(RedisSinkConfig.SENTINEL_PASSWORD).value());
 
         try {
             createRedisConnection();
