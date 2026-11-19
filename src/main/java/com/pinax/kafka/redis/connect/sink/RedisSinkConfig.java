@@ -10,10 +10,10 @@ public class RedisSinkConfig {
         // Redis sink configuration
         public static final String MASTER = "master";
         public static final String HOSTS = "hosts";
-        public static final String USERNAME = "username";
-        public static final String PASSWORD = "password";
-        public static final String SENTINEL_USERNAME = "sentinelUsername";
-        public static final String SENTINEL_PASSWORD = "sentinelPassword";
+        public static final String USERNAME = "redis_username";
+        public static final String PASSWORD = "redis_password";
+        public static final String SENTINEL_USERNAME = "redis_sentinel_username";
+        public static final String SENTINEL_PASSWORD = "redis_sentinel_password";
         public static final String OFFSETS_KEY = "offsetsKey";
         public static final String RETRY_BACKOFF_MS = "retryBackoffMs";
         public static final String CONFLICT_RETRY_BACKOFF_MS = "conflictRetryBackoffMs";

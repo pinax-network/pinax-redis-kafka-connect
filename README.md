@@ -61,10 +61,10 @@ and restart the worker.
 |-------------------|----------|----------------------|-----------------------------------------------------------------|
 | `master`          | no       | `mymaster`           | Redis Sentinel master name.                                     |
 | `hosts`           | no       | `localhost:6379`     | Comma-separated list of Sentinel `host:port` addresses.         |
-| `username`        | no       | —                    | User to authenticate as on the Redis nodes. Empty with a `password` set: the `default` user. |
-| `password`        | no       | —                    | Password for the Redis nodes. Empty: no authentication.         |
-| `sentinelUsername` | no      | —                    | User to authenticate as on the Sentinels. Empty with a `sentinelPassword` set: the `default` user. |
-| `sentinelPassword` | no      | —                    | Password for the Sentinels. They authenticate separately from the Redis nodes, so set it also when it is the same password. Empty: no authentication. |
+| `redis_username`  | no       | —                    | User to authenticate as on the Redis nodes. Empty with a `redis_password` set: the `default` user. |
+| `redis_password`  | no       | —                    | Password for the Redis nodes. Empty: no authentication.         |
+| `redis_sentinel_username` | no | —                  | User to authenticate as on the Sentinels. Empty with a `redis_sentinel_password` set: the `default` user. |
+| `redis_sentinel_password` | no | —                    | Password for the Sentinels. They authenticate separately from the Redis nodes, so set it also when it is the same password. Empty: no authentication. |
 | `offsetsKey`      | no       | `kafka-connect:redis-sink:offsets` | Prefix of the hashes holding the applied offsets, one per topic (`<offsetsKey>:<topic>`). |
 | `retryBackoffMs`  | no       | `5000`               | Milliseconds before a batch is retried after Redis was unreachable or not accepting writes. |
 | `conflictRetryBackoffMs` | no | `1000`              | Milliseconds before a batch is retried after its transaction was refused because the stored offsets changed. |
