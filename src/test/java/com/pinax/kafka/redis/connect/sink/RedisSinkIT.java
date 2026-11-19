@@ -9,7 +9,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.time.Instant;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -97,6 +99,30 @@ class RedisSinkIT {
                     wrong.ping();
                 }
             });
+        }
+    }
+
+    @Test
+    void sentinelCredentialsCheckFailsOnRefusedCredentialsAndSkipsUnreachableSentinels() {
+        // A Redis with requirepass stands in for a Sentinel: the check only
+        // authenticates and pings, which a Sentinel answers the same way.
+        try (GenericContainer<?> protectedSentinel = new GenericContainer<>(DockerImageName.parse("redis:7-alpine"))
+                .withCommand("redis-server", "--requirepass", "s3cret")
+                .withExposedPorts(6379)
+                .waitingFor(Wait.forListeningPort())) {
+            protectedSentinel.start();
+            HostAndPort reachable = new HostAndPort(protectedSentinel.getHost(), protectedSentinel.getMappedPort(6379));
+            // Nothing listens there; connecting is refused at once.
+            HostAndPort unreachable = new HostAndPort("127.0.0.1", 1);
+            Set<HostAndPort> sentinels = new LinkedHashSet<HostAndPort>(List.of(unreachable, reachable));
+
+            RedisSinkTask.checkSentinelCredentials(sentinels, RedisSinkTask.clientConfig("", "s3cret"));
+            assertThrows(JedisAccessControlException.class,
+                    () -> RedisSinkTask.checkSentinelCredentials(sentinels, RedisSinkTask.clientConfig("", "wrong")));
+            assertThrows(JedisAccessControlException.class,
+                    () -> RedisSinkTask.checkSentinelCredentials(sentinels, RedisSinkTask.clientConfig("", "")));
+            // No Sentinel answers: left to the pool, which reports the outage.
+            RedisSinkTask.checkSentinelCredentials(Set.of(unreachable), RedisSinkTask.clientConfig("", "wrong"));
         }
     }
 

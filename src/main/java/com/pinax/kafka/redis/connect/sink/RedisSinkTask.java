@@ -82,10 +82,33 @@ public class RedisSinkTask extends SinkTask {
         // Let connection failures propagate. Callers decide how to react: startup
         // tolerates them (put() retries lazily) and put() maps them to a
         // RetriableException so Kafka Connect re-delivers the batch.
+        checkSentinelCredentials(sentinels, sentinelClientConfig);
         jedisSentinelPool = new JedisSentinelPool(redisMaster, sentinels, redisClientConfig, sentinelClientConfig);
         jedis = jedisSentinelPool.getResource();
 
         logger.info("Redis connection created");
+    }
+
+    /**
+     * Throws the {@link JedisAccessControlException} of the first Sentinel that
+     * answers if it refuses the credentials, and skips the ones that cannot be
+     * reached. {@link JedisSentinelPool} cannot be relied on for this: it takes a
+     * refusal for an unavailable Sentinel and, when all refuse, reports them all as
+     * down, which the task would retry instead of failing on.
+     */
+    static void checkSentinelCredentials(Set<HostAndPort> sentinels, JedisClientConfig config) {
+        for (HostAndPort sentinel : sentinels) {
+            try (Jedis probe = new Jedis(sentinel, config)) {
+                probe.ping();
+                return;
+            } catch (JedisAccessControlException e) {
+                throw e;
+            } catch (JedisException e) {
+                // Unreachable or not answering: left to the pool, which tries the
+                // others and reports an outage when none answers.
+                LoggerFactory.getLogger(RedisSinkConnector.class).debug("Sentinel {} did not answer the credentials check", sentinel, e);
+            }
+        }
     }
 
     /**

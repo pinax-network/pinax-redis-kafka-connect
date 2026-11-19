@@ -92,12 +92,23 @@ below.
     "hosts": "sentinel-a:26379,sentinel-b:26379,sentinel-c:26379",
     "from": "billing@pinax.network",
     "mailchimpApiKey": "${file:/secrets/mandrill.properties:apiKey}",
+    "redis_password": "${file:/secrets/redis.properties:password}",
+    "redis_sentinel_password": "${file:/secrets/redis.properties:sentinelPassword}",
     "templateSlug": "monthly-usage-update",
     "key.converter": "org.apache.kafka.connect.storage.StringConverter",
     "value.converter": "org.apache.kafka.connect.storage.StringConverter"
   }
 }
 ```
+
+Give the secrets (`mailchimpApiKey`, `redis_password`, `redis_sentinel_password`) as
+[ConfigProvider](https://kafka.apache.org/documentation/#config_providers) references,
+as above, not as literal values. The connector keeps them out of its log, but Connect
+stores the configuration as submitted and returns it as is from
+`GET /connectors/{name}/config`: a literal secret can be read back there, a reference
+resolves only inside the worker. The `file` provider has to be enabled on the worker
+(`config.providers=file` and
+`config.providers.file.class=org.apache.kafka.common.config.provider.FileConfigProvider`).
 
 ## Record format
 
